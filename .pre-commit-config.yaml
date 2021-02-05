@@ -1,0 +1,30 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v2.3.0
+    hooks:
+    -   id: check-added-large-files
+    -   id: check-ast
+    -   id: check-case-conflict
+    -   id: check-executables-have-shebangs
+    -   id: check-yaml
+    -   id: end-of-file-fixer
+    -   id: trailing-whitespace
+  - repo: https://github.com/asottile/pyupgrade
+    rev: v2.1.0
+    hooks:
+    -   id: pyupgrade
+        args: [--py36-plus]
+  - repo: git://github.com/FalconSocial/pre-commit-python-sorter
+    rev: master
+    hooks:
+    -   id: python-import-sorter
+  - repo: https://github.com/psf/black
+    rev: stable
+    hooks:
+      - id: black
+        language_version: python3.8
+  - repo: https://github.com/kynan/nbstripout
+    rev: master
+    hooks:
+      - id: nbstripout
+        files: ".ipynb"
