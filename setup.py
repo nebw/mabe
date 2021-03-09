@@ -5,10 +5,10 @@ except ImportError:
 
 
 setup(
-    name="template",
+    name="mabe",
     version="0.1",
     description="",
     author="Benjamin Wild",
     author_email="b.w@fu-berlin.de",
-    packages=["template"],
+    packages=["mabe"],
 )
