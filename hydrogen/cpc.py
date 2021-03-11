@@ -92,14 +92,16 @@ class CausalConv1D(torch.nn.Module):
 
 
 class Embedder(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, **kwargs):
+    def __init__(self, in_channels, out_channels, dropout=0, **kwargs):
         super().__init__()
 
-        self.reduction = 2 ** 4
+        self.reduction = 2 ** 5
 
         self.head = CausalConv1D(in_channels, out_channels)
+        self.dropout = torch.nn.Dropout(dropout)
         self.convolutions = torch.nn.ModuleList(
             [
+                CausalConv1D(out_channels, out_channels, dilation=2),
                 CausalConv1D(out_channels, out_channels, dilation=2),
                 CausalConv1D(out_channels, out_channels, dilation=2),
                 CausalConv1D(out_channels, out_channels, dilation=2),
@@ -112,7 +114,7 @@ class Embedder(torch.nn.Module):
         x = self.head(x)
         for i, l in enumerate(self.convolutions):
             x_ = torch.nn.functional.leaky_relu(l(x))
-            x = x + x_
+            x = x + self.dropout(x_)
 
         return x
 
@@ -150,20 +152,27 @@ def nt_xent_loss(predictions_to, has_value_to=None, cpc_tau=0.07, cpc_alpha=0.5)
 
 
 # %%
-batch_size = 64
+batch_size = 128
 num_batches = 100000
-subsample_length = 256
+subsample_length = 512
 indices = np.arange(len(X))
 num_features = X[0].shape[-1]
 num_embeddings = 128
 num_context = 128
-num_ahead = 64
+num_ahead = 128
+dropout = 0.1
 device = "cuda:1"
 
-embedder = Embedder(num_features, num_embeddings).to(device)
-contexter = torch.nn.GRU(num_embeddings, num_context, batch_first=True).to(device)
+# %%
+embedder = Embedder(num_features, num_embeddings, dropout=dropout).to(device).train()
+contexter = (
+    torch.nn.GRU(num_embeddings, num_context, batch_first=True, dropout=dropout, num_layers=2)
+    .to(device)
+    .train()
+)
 projections = [
-    torch.nn.Linear(num_context, num_embeddings, bias=False).to(device) for _ in range(num_ahead)
+    torch.nn.Linear(num_context, num_embeddings, bias=False).to(device)
+    for _ in range(num_ahead // 4)
 ]
 
 params = list(itertools.chain.from_iterable(map(lambda p: list(p.parameters()), projections)))
@@ -176,6 +185,9 @@ optimizer = torch.optim.AdamW(params)
 losses = []
 
 # %%
+embedder = embedder.train()
+contexter = contexter.train()
+
 bar = progress_bar(range(num_batches))
 for i_batch in bar:
     optimizer.zero_grad()
@@ -184,7 +196,6 @@ for i_batch in bar:
     X_batch = [X[i].astype(np.float32) for i in indices_batch]
 
     padding = np.array([max(0, subsample_length + num_ahead - len(x)) for x in X_batch])
-    # be careful when sampling CPC prediction targets!
 
     X_batch = [np.pad(x, ((0, pad), (0, 0))) for x, pad in zip(X_batch, padding)]
 
@@ -202,7 +213,6 @@ for i_batch in bar:
     X_batch = torch.transpose(torch.from_numpy(X_batch), 2, 1).to(device)
     X_emb = embedder(X_batch)
 
-    # add padding here!
     max_from_timesteps = [x.shape[-1] - num_ahead for x in X_emb]
     from_timesteps = np.random.randint(
         low=0,
@@ -220,8 +230,8 @@ for i_batch in bar:
 
     ahead = 0
     batch_loss = []
-    for ahead in range(1, num_ahead):
-        embeddings_projected = projections[ahead](contexts_from)
+    for ahead in range(1, num_ahead, 4):
+        embeddings_projected = projections[ahead // 4](contexts_from)
         embeddings_to = torch.stack(
             [X_emb[i, :, from_timesteps_reduced[i] + ahead] for i in range(batch_size)]
         )
@@ -230,10 +240,12 @@ for i_batch in bar:
         # assume both are l2-normalized -> cosine similarity
         predictions_to = torch.einsum("ae,ce->ac", contexts_from, embeddings_to)
 
-        loss = nt_xent_loss(predictions_to)
+        has_value_to = torch.from_numpy((from_timesteps_reduced + ahead) < valid_lengths).to(device)
+        loss = nt_xent_loss(predictions_to, has_value_to)
         loss_mean = torch.mean(loss)
 
         batch_loss.append(loss_mean)
+
     batch_loss = sum(batch_loss) / len(batch_loss)
 
     batch_loss.backward()
@@ -247,6 +259,15 @@ plt.plot(np.arange(len(losses) - 100) + 100, losses[100:], alpha=0.1)
 plt.plot(pd.Series(losses).rolling(100).mean())
 
 # %%
+torch.save((embedder, contexter, projections, losses), mabe.config.ROOT_PATH / "cpc_model_2.pt")
+
+# %%
+embedder, contexter, projections, losses = torch.load(mabe.config.ROOT_PATH / "cpc_model_2.pt")
+
+# %%
+embedder = embedder.eval()
+contexter = contexter.eval()
+
 contexts = []
 with torch.no_grad():
     bar = progress_bar(range(len(X_train)))
@@ -256,6 +277,8 @@ with torch.no_grad():
         x_emb = embedder(x)
 
         c, _ = contexter(x_emb.transpose(2, 1))
+        c = torch.nn.functional.normalize(c, p=2, dim=-1)
+
         contexts.append(c.cpu().numpy()[0])
 
 train_contexts = np.concatenate(contexts)
