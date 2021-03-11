@@ -38,6 +38,7 @@ with h5py.File(feature_path, "r") as hdf:
 
     test_X = load_all("test/x")
     test_Y = load_all("test/y")
+    test_groups = list(map(lambda v: v[()], hdf["test/groups"].values()))
 
 # %%
 X = train_X + test_X
