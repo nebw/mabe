@@ -42,10 +42,12 @@ with h5py.File(feature_path, "r") as hdf:
 
 # %%
 X = train_X + test_X
+Y = train_Y + test_Y
 
 scaler = sklearn.preprocessing.StandardScaler().fit(np.concatenate(X))
 X = list(map(lambda x: scaler.transform(x), X))
 X_train = list(map(lambda x: scaler.transform(x), train_X))
+X_test = list(map(lambda x: scaler.transform(x), test_X))
 
 # Dimensions: (# frames) x (mouse ID) x (x, y coordinate) x (body part).
 # Units: pixels; coordinates are relative to the entire image.
@@ -55,7 +57,7 @@ X_train = list(map(lambda x: scaler.transform(x), train_X))
 sample_lengths = np.array(list(map(len, X)))
 p_draw = sample_lengths / np.sum(sample_lengths)
 
-min(sample_lengths)
+min(sample_lengths), max(sample_lengths)
 
 # %%
 class CausalConv1D(torch.nn.Module):
@@ -284,6 +286,25 @@ with torch.no_grad():
 train_contexts = np.concatenate(contexts)
 
 # %%
+embedder = embedder.eval()
+contexter = contexter.eval()
+
+contexts = []
+with torch.no_grad():
+    bar = progress_bar(range(len(X_test)))
+    for idx in bar:
+        x = X_test[idx].astype(np.float32)
+        x = torch.transpose(torch.from_numpy(x[None, :, :]), 2, 1).to(device)
+        x_emb = embedder(x)
+
+        c, _ = contexter(x_emb.transpose(2, 1))
+        c = torch.nn.functional.normalize(c, p=2, dim=-1)
+
+        contexts.append(c.cpu().numpy()[0])
+
+test_contexts = np.concatenate(contexts)
+
+# %%
 train_Y_flat = np.concatenate(train_Y)
 train_X_flat = np.concatenate(X_train)
 train_groups = np.concatenate([np.ones(len(X_train[i])) * i for i in range(len(X_train))]).astype(
@@ -291,7 +312,9 @@ train_groups = np.concatenate([np.ones(len(X_train[i])) * i for i in range(len(X
 )
 
 # %%
-linear = sklearn.linear_model.LogisticRegression(multi_class="multinomial", max_iter=1000, C=1e20)
+linear = sklearn.linear_model.LogisticRegression(
+    multi_class="multinomial", max_iter=1000, C=1e20, n_jobs=-1
+)
 linear.fit(train_contexts, train_Y_flat)
 train_Y_pred = linear.predict(train_contexts)
 
@@ -300,7 +323,7 @@ sklearn.metrics.f1_score(
 ), sklearn.metrics.precision_score(train_Y_flat, train_Y_pred, average="macro")
 
 # %%
-linear = sklearn.linear_model.LogisticRegression(multi_class="multinomial", max_iter=1000)
+linear = sklearn.linear_model.LogisticRegression(multi_class="multinomial", max_iter=1000, C=1e20)
 scores = sklearn.model_selection.cross_validate(
     linear,
     train_contexts,
@@ -313,7 +336,6 @@ scores = sklearn.model_selection.cross_validate(
         precision=sklearn.metrics.make_scorer(sklearn.metrics.precision_score, average="macro"),
     ),
 )
-
 np.median(scores["test_f1"]), np.median(scores["test_precision"])
 
 # %%
