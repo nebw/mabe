@@ -2,6 +2,7 @@
 
 import copy
 import datetime
+from typing import Union
 
 import click
 import click_pathlib
@@ -200,7 +201,7 @@ def train_model(config, data, split, device):
     return result
 
 
-def parse_optional_parameter(val: str):
+def parse_optional_parameter(val: Union[str, int, float]) -> Union[str, int, float]:
     try:
         val = int(val)
     except ValueError:
