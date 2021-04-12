@@ -17,7 +17,7 @@ master_bar, progress_bar = force_console_behavior()
 train_path = mabe.config.ROOT_PATH / "train.npy"
 test_path = mabe.config.ROOT_PATH / "test-release.npy"
 pca_path = mabe.config.ROOT_PATH / "pose-pca.joblib"
-feature_path = mabe.config.ROOT_PATH / "features_debug.hdf5"
+feature_path = mabe.config.ROOT_PATH / "features_pca.hdf5"
 
 # %% codecell
 pose_pca = joblib.load(pca_path)
@@ -99,16 +99,18 @@ def transform_to_feature_vector(trajectory, with_abs_pos=False, with_pca=True):
     m0, mid0 = normalize_mouse(m0)
     m1, mid1 = normalize_mouse(m1)
 
-    if with_pca:
-        m0 = pose_pca.transform(m0)
-        m1 = pose_pca.transform(m1)
-
     if with_abs_pos:
         m0 = np.concatenate((m0, mid0[:, :, None]), axis=-1)
         m1 = np.concatenate((m1, mid1[:, :, None]), axis=-1)
 
     m0 = m0.reshape(-1, m0.shape[1] * m0.shape[2])
     m1 = m1.reshape(-1, m1.shape[1] * m1.shape[2])
+
+    if with_pca:
+        assert not with_abs_pos
+
+        m0 = pose_pca.transform(m0)
+        m1 = pose_pca.transform(m1)
 
     features = np.concatenate(
         (m0[1:], m1[1:], velocity, orientation, relative_position_info[1:]), axis=1

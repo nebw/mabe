@@ -1,14 +1,7 @@
-import collections
-import datetime
-
-import h5py
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
-import sklearn
-import sklearn.decomposition
-import sklearn.linear_model
-import sklearn.preprocessing
+import scipy
+import scipy.special
 import torch
 from fastprogress.fastprogress import force_console_behavior
 
@@ -16,27 +9,30 @@ import mabe
 import mabe.config
 import mabe.loss
 import mabe.model
+import mabe.training
 
 # %%
 master_bar, progress_bar = force_console_behavior()
 
 # %%
-feature_path = mabe.config.ROOT_PATH / "features.hdf5"
-
-# %%
-submissions = ("submission4.2.npy",)
-submissions = list(
-    map(lambda p: np.load(mabe.config.ROOT_PATH / p, allow_pickle=True).item(), submissions)
+results_path = (
+    mabe.config.ROOT_PATH / "training_results_2021-04-10 19:36:30.018611_baseline_madgrad_0.834.pt"
 )
+results = torch.load(results_path)
 
 # %%
-merged_submission = {}
+keys = results[0].test_logits.keys()
 
-for key in submissions[0].keys():
-    preds = np.stack(list(map(lambda s: s[key], submissions)))
-    preds = np.argmax(np.mean(preds, axis=0), axis=-1)
+merged_submission = {}
+for key in keys:
+    preds = np.stack(list(map(lambda s: s.test_logits[key], results)))
+    preds = np.argmax(scipy.special.softmax(preds, -1).mean(axis=0), axis=-1)
 
     merged_submission[key] = preds
+
+
+plt.plot(preds)
+
 
 # %%
 sample_submission = np.load(
@@ -70,4 +66,4 @@ def validate_submission(submission, sample_submission):
 
 
 if validate_submission(merged_submission, sample_submission):
-    np.save(mabe.config.ROOT_PATH / "submission4_only.2.npy", merged_submission)
+    np.save(mabe.config.ROOT_PATH / "submission5.npy", merged_submission)
