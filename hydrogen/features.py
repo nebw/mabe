@@ -1,7 +1,11 @@
 # %% codecell
 import h5py
+import joblib
+import matplotlib.pyplot as plt
 import numba
 import numpy as np
+import sklearn
+import sklearn.decomposition
 from fastprogress.fastprogress import force_console_behavior
 
 import mabe
@@ -12,7 +16,11 @@ master_bar, progress_bar = force_console_behavior()
 
 train_path = mabe.config.ROOT_PATH / "train.npy"
 test_path = mabe.config.ROOT_PATH / "test-release.npy"
-feature_path = mabe.config.ROOT_PATH / "features.hdf5"
+pca_path = mabe.config.ROOT_PATH / "pose-pca.joblib"
+feature_path = mabe.config.ROOT_PATH / "features_debug.hdf5"
+
+# %% codecell
+pose_pca = joblib.load(pca_path)
 
 # %% codecell
 @numba.njit
@@ -27,12 +35,13 @@ def get_mouse_orientation_angle(mouse):
 
 
 @numba.njit
-def inplace_rotate_broadcast(vector, angle):
+def rotate_broadcast(vector, angle):
     vector = vector.astype(np.float32)
     for t_idx in range(vector.shape[0]):
         c, s = np.cos(-angle[t_idx]), np.sin(-angle[t_idx])
         R = np.array([[c, -s], [s, c]], dtype=np.float32)
         vector[t_idx] = np.dot(R, vector[t_idx])
+    return vector
 
 
 def normalize_mouse(mouse):
@@ -41,9 +50,9 @@ def normalize_mouse(mouse):
     mid_coords = (tail_coords + neck_coords) / 2.0
     mouse -= mid_coords[:, :, None]
 
-    inplace_rotate_broadcast(mouse, body_angle)
+    mouse = rotate_broadcast(mouse, body_angle)
 
-    return mouse
+    return mouse, mid_coords
 
 
 def get_distance_angle_to(xy0, xy1):
@@ -61,9 +70,9 @@ def get_distance_angle_between_mice(m0, m1):
     tail_coords, neck_coords, orientation_vector, body_angle = get_mouse_orientation_angle(m0)
 
     v0, d0 = get_distance_angle_to(neck0, neck1)
-    inplace_rotate_broadcast(v0, body_angle)
+    v0 = rotate_broadcast(v0, body_angle)
     v1, d1 = get_distance_angle_to(neck0, butt1)
-    inplace_rotate_broadcast(v1, body_angle)
+    v1 = rotate_broadcast(v1, body_angle)
 
     return np.concatenate((v0, d0, v1, d1), axis=1)
 
@@ -82,13 +91,21 @@ def get_movement_velocity_orienation(mouse):
     return velocity, orientation_change
 
 
-def transform_to_feature_vector(trajectory):
+def transform_to_feature_vector(trajectory, with_abs_pos=False, with_pca=True):
     m0 = trajectory[:, 0, :, :].copy()
     m1 = trajectory[:, 1, :, :].copy()
     velocity, orientation = get_movement_velocity_orienation(m0)
     relative_position_info = get_distance_angle_between_mice(m0, m1)
-    m0 = normalize_mouse(m0)
-    m1 = normalize_mouse(m1)
+    m0, mid0 = normalize_mouse(m0)
+    m1, mid1 = normalize_mouse(m1)
+
+    if with_pca:
+        m0 = pose_pca.transform(m0)
+        m1 = pose_pca.transform(m1)
+
+    if with_abs_pos:
+        m0 = np.concatenate((m0, mid0[:, :, None]), axis=-1)
+        m1 = np.concatenate((m1, mid1[:, :, None]), axis=-1)
 
     m0 = m0.reshape(-1, m0.shape[1] * m0.shape[2])
     m1 = m1.reshape(-1, m1.shape[1] * m1.shape[2])
@@ -136,6 +153,20 @@ X, Y, groups = load_dataset(train_path)
 
 # %% codecell
 X_test, Y_test, groups_test = load_dataset(test_path)
+
+# %%
+"""
+X_m0 = np.concatenate([x[:, :14] for x in X])
+X_m1 = np.concatenate([x[:, 14:14+14] for x in X])
+X_test_m0 = np.concatenate([x[:, :14] for x in X_test])
+X_test_m1 = np.concatenate([x[:, 14:14+14] for x in X_test])
+mouse_poses = np.concatenate((X_m0, X_m1, X_test_m0, X_test_m1))
+
+pca = sklearn.decomposition.PCA(n_components=11)
+pca.fit(mouse_poses)
+
+joblib.dump(pca, pca_path)
+"""
 
 # %% codecell
 len(X), len(Y), len(groups)

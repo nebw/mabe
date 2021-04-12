@@ -1,9 +1,9 @@
+import math
+
+import numba
 import numpy as np
 import torch
 from fastprogress.fastprogress import force_console_behavior
-
-import mabe
-import mabe.custom_lstms
 
 master_bar, progress_bar = force_console_behavior()
 
@@ -16,7 +16,6 @@ class CausalConv1D(torch.nn.Module):
         kernel_size=3,
         dilation=1,
         downsample=False,
-        layer_norm=False,
         **conv1d_kwargs,
     ):
         super().__init__()
@@ -30,16 +29,12 @@ class CausalConv1D(torch.nn.Module):
             dilation=dilation,
             **conv1d_kwargs,
         )
-        self.layer_norm = layer_norm
 
     def forward(self, x):
-        if self.layer_norm:
-            x = torch.nn.functional.layer_norm(x, x.shape[1:])
-
         x = self.conv(x)
 
         # remove trailing padding
-        x = x[:, :, : -self.conv.padding[0]]
+        x = x[:, :, self.pad : -self.pad]
 
         if self.downsample:
             x = x[:, :, :: self.conv.dilation[0]]
@@ -47,30 +42,134 @@ class CausalConv1D(torch.nn.Module):
         return x
 
 
-class Embedder(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, dropout=0, **kwargs):
+class ResidualBlock(torch.nn.Module):
+    def __init__(self, channels, padding, kernel_size, layer_norm=False, causal=False, **kwargs):
         super().__init__()
 
-        self.reduction = 2 ** 5
+        # TODO: add dilation
+        self.offset = (kernel_size - 1) // 2
+        self.causal = causal
 
-        self.head = CausalConv1D(in_channels, out_channels)
-        self.dropout = torch.nn.Dropout(dropout)
-        self.convolutions = torch.nn.ModuleList(
-            [
-                CausalConv1D(out_channels, out_channels, dilation=2, layer_norm=True),
-                CausalConv1D(out_channels, out_channels, dilation=2, layer_norm=True),
-                CausalConv1D(out_channels, out_channels, dilation=2, layer_norm=True),
-                CausalConv1D(out_channels, out_channels, dilation=2, layer_norm=True),
-                CausalConv1D(out_channels, out_channels, dilation=2, layer_norm=True),
-                CausalConv1D(out_channels, out_channels, layer_norm=True),
-            ]
+        self.conv1 = torch.nn.Conv1d(channels, channels, padding=padding, kernel_size=kernel_size)
+        self.conv2 = torch.nn.Conv1d(channels, channels, padding=padding, kernel_size=kernel_size)
+
+        self.layer_norm = layer_norm
+        self.layer_norm1 = torch.nn.LayerNorm(channels) if layer_norm else None
+        self.layer_norm2 = torch.nn.LayerNorm(channels) if layer_norm else None
+
+    def forward(self, x):
+        x_ = x
+
+        if self.layer_norm:
+            x = x.transpose(2, 1)
+            x = self.layer_norm1(x)
+            x = x.transpose(2, 1)
+        x = torch.nn.functional.leaky_relu(x)
+        x = self.conv1(x)
+
+        if self.layer_norm:
+            x = x.transpose(2, 1)
+            x = self.layer_norm2(x)
+            x = x.transpose(2, 1)
+        x = torch.nn.functional.leaky_relu(x)
+        x = self.conv2(x)
+
+        if self.offset > 0:
+            if self.causal:
+                x_ = x_[:, :, 4 * self.offset :]
+            else:
+                x_ = x_[:, :, 2 * self.offset : -2 * self.offset]
+        return x_ + x
+
+
+class Embedder(torch.nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        layer_norm=True,
+        input_dropout=0,
+        head_dropout=0,
+        num_embedder_blocks=3,
+        **kwargs,
+    ):
+        super().__init__()
+
+        self.input_dropout = torch.nn.Dropout2d(p=input_dropout)
+        self.head_dropout = torch.nn.Dropout2d(p=head_dropout)
+
+        self.dropout = torch.nn.Dropout(input_dropout)
+        self.head = torch.nn.Conv1d(in_channels, out_channels, kernel_size=1, padding=0)
+
+        self.convolutions = torch.nn.Sequential(
+            ResidualBlock(out_channels, kernel_size=1, padding=0, layer_norm=layer_norm),
+            ResidualBlock(out_channels, kernel_size=1, padding=0, layer_norm=layer_norm),
+            *[
+                ResidualBlock(out_channels, kernel_size=3, padding=0, layer_norm=layer_norm)
+                for _ in range(num_embedder_blocks)
+            ],
         )
 
     def forward(self, x):
+        x = self.input_dropout(x)
         x = self.head(x)
-        for i, l in enumerate(self.convolutions):
-            x_ = torch.nn.functional.leaky_relu(l(x))
-            x = x + self.dropout(x_)
+        x = self.head_dropout(x)
+
+        x = self.convolutions(x)
+
+        return x
+
+
+class CausalResidualBlock(torch.nn.Module):
+    def __init__(self, channels, layer_norm=False, **kwargs):
+        super().__init__()
+
+        self.conv1 = CausalConv1D(channels, channels, dilation=2)
+        self.conv2 = CausalConv1D(channels, channels, dilation=1)
+
+        self.layer_norm = layer_norm
+        self.layer_norm1 = torch.nn.LayerNorm(channels) if layer_norm else None
+        self.layer_norm2 = torch.nn.LayerNorm(channels) if layer_norm else None
+
+    def forward(self, x):
+        x_ = x
+
+        if self.layer_norm:
+            x = x.transpose(2, 1)
+            x = self.layer_norm1(x)
+            x = x.transpose(2, 1)
+        x = torch.nn.functional.leaky_relu(x)
+        x = self.conv1(x)
+
+        if self.layer_norm:
+            x = x.transpose(2, 1)
+            x = self.layer_norm2(x)
+            x = x.transpose(2, 1)
+        x = torch.nn.functional.leaky_relu(x)
+        x = self.conv2(x)
+
+        return x_ + x
+
+
+class Contexter(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, layer_norm=True, dropout=0, **kwargs):
+        super().__init__()
+
+        self.head = CausalConv1D(in_channels, out_channels)
+        self.convolutions = torch.nn.Sequential(
+            *[
+                ResidualBlock(
+                    out_channels, kernel_size=3, padding=0, layer_norm=layer_norm, causal=True
+                )
+                for i in range(8)
+            ]
+        )
+        self.dropout = torch.nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.head(x)
+        x = self.convolutions(x)
+        x = self.dropout(x)
 
         return x
 
@@ -107,7 +206,20 @@ def nt_xent_loss(predictions_to, has_value_to=None, cpc_tau=0.07, cpc_alpha=0.5)
     return loss
 
 
-class CPC(torch.nn.Module):
+@numba.njit
+def subsample(X, X_, valid_lengths, combined_length, subsample_from_rand, reverse):
+    for i, x in enumerate(X):
+        from_idx = math.floor(subsample_from_rand[i] * max(0, len(x) - combined_length))
+        to_idx = min(len(x), from_idx + combined_length)
+        valid_length = to_idx - from_idx
+        sample = x[from_idx:to_idx]
+        if reverse:
+            sample = sample[::-1]
+        X_[i, :valid_length] = sample
+        valid_lengths[i] = valid_length
+
+
+class ConvCPC(torch.nn.Module):
     def __init__(
         self,
         num_features,
@@ -116,7 +228,10 @@ class CPC(torch.nn.Module):
         num_ahead,
         num_ahead_subsampling,
         subsample_length,
-        num_rnn_layers=2,
+        split_idx,
+        num_embedder_blocks=3,
+        input_dropout=0,
+        head_dropout=0,
         dropout=0,
         reverse_time=False,
         **kwargs,
@@ -125,12 +240,18 @@ class CPC(torch.nn.Module):
 
         self.num_embeddings = num_embeddings
         self.num_context = num_context
-        self.num_rnn_layers = num_rnn_layers
+        self.num_features = num_features
+        self.split_idx = split_idx
 
-        self.embedder = Embedder(num_features, num_embeddings, dropout=dropout)
-        self.contexter = mabe.custom_lstms.script_lnlstm(
-            num_embeddings, num_context, num_rnn_layers, batch_first=False
+        self.embedder = Embedder(
+            num_features,
+            num_embeddings,
+            num_embedder_blocks=num_embedder_blocks,
+            input_dropout=input_dropout,
+            head_dropout=head_dropout,
+            dropout=dropout,
         )
+        self.contexter = Contexter(num_embeddings, num_context, dropout=dropout)
 
         self.projections = torch.nn.ModuleList(
             [
@@ -144,42 +265,42 @@ class CPC(torch.nn.Module):
         self.subsample_length = subsample_length
         self.reverse_time = reverse_time
 
-    def subsample_and_pad(self, X, Y=None, device="cpu"):
+        for m in self.modules():
+            if isinstance(m, torch.nn.Conv1d):
+                torch.nn.init.kaiming_normal_(m.weight, mode="fan_out")
+                torch.nn.init.zeros_(m.bias)
+            elif isinstance(m, torch.nn.LayerNorm):
+                torch.nn.init.constant_(m.weight, 1)
+                torch.nn.init.constant_(m.bias, 0)
+            elif isinstance(m, torch.nn.Linear):
+                torch.nn.init.kaiming_normal_(m.weight, mode="fan_out")
+                if m.bias is not None:
+                    torch.nn.init.zeros_(m.bias)
+
+    def random_subsample(self, X, Y=None, subsample_from_rand=None):
         batch_size = len(X)
+        if subsample_from_rand is None:
+            subsample_from_rand = np.random.rand(batch_size)
+        combined_length = self.subsample_length + self.num_ahead
 
-        padding = np.array([max(0, self.subsample_length + self.num_ahead - len(x)) for x in X])
-
-        X = [np.pad(x, ((0, pad), (0, 0))) for x, pad in zip(X, padding)]
-
-        valid_lengths = np.array([len(x) - pad for x, pad in zip(X, padding)])
-        subsample_from_max = np.clip(
-            valid_lengths - self.subsample_length - self.num_ahead, 0, np.inf
-        )
-        subsample_from = np.floor(np.random.rand(batch_size) * subsample_from_max).astype(np.int)
-
-        X = np.stack(
-            [
-                X[i][subsample_from[i] : subsample_from[i] + self.subsample_length + self.num_ahead]
-                for i in range(batch_size)
-            ]
-        )
-
-        X = torch.transpose(torch.from_numpy(X), 2, 1).to(device)
+        X_ = np.zeros((batch_size, combined_length, self.num_features), dtype=np.float32)
+        valid_lengths = np.zeros(batch_size, dtype=np.int)
+        subsample(X, X_, valid_lengths, combined_length, subsample_from_rand, self.reverse_time)
 
         if Y is not None:
-            Y = [np.pad(y, ((0, pad)), constant_values=-1.0) for y, pad in zip(Y, padding)]
+            Y_ = np.full((batch_size, combined_length), -1, dtype=np.int)
+            subsample(Y, Y_, valid_lengths, combined_length, subsample_from_rand, self.reverse_time)
+        else:
+            Y_ = None
 
-            Y = np.stack(
-                [
-                    Y[i][
-                        subsample_from[i] : subsample_from[i]
-                        + self.subsample_length
-                        + self.num_ahead
-                    ]
-                    for i in range(batch_size)
-                ]
-            )
-            Y = torch.from_numpy(Y).to(device)
+        return X_, Y_, valid_lengths
+
+    def subsample_and_pad(self, X, Y=None, device="cpu", subsample_from_rand=None):
+        X, Y, valid_lengths = self.random_subsample(X, Y, subsample_from_rand=subsample_from_rand)
+        X = torch.transpose(torch.from_numpy(X), 2, 1).to(device, non_blocking=True)
+
+        if Y is not None:
+            Y = torch.from_numpy(Y).to(device, non_blocking=True)
 
         return X, Y, valid_lengths
 
@@ -191,25 +312,39 @@ class CPC(torch.nn.Module):
             [contexts[i, from_timesteps_reduced[i]] for i in range(batch_size)]
         )
 
-        ahead = 0
-        batch_loss = []
-        for ahead in range(1, self.num_ahead, self.num_ahead_subsampling):
-            embeddings_projected = self.projections[ahead // self.num_ahead_subsampling](
-                contexts_from
-            )
-            embeddings_projected = torch.nn.functional.normalize(embeddings_projected, p=2, dim=-1)
-            embeddings_to = torch.stack(
-                [X_emb[i, :, from_timesteps_reduced[i] + ahead] for i in range(batch_size)]
-            )
-            embeddings_to = torch.nn.functional.normalize(embeddings_to, p=2, dim=-1)
+        embeddings_projections = torch.stack(
+            list(map(lambda p: p(contexts_from), self.projections))
+        )
+        embeddings_projections = torch.nn.functional.normalize(embeddings_projections, p=2, dim=-1)
 
-            # assume both are l2-normalized -> cosine similarity
-            predictions_to = torch.einsum("ae,ce->ac", embeddings_projected, embeddings_to)
+        ahead = torch.arange(self.num_ahead_subsampling, self.num_ahead, self.num_ahead_subsampling)
+        to_timesteps = torch.from_numpy(from_timesteps_reduced)[:, None] + ahead
+
+        X_emb_t = X_emb.transpose(2, 1)
+        embeddings_to = X_emb_t[
+            torch.arange(batch_size)[:, None].repeat(1, len(ahead)).flatten(),
+            to_timesteps.flatten(),
+        ].reshape(batch_size, len(ahead), -1)
+        embeddings_to = torch.nn.functional.normalize(embeddings_to, p=2, dim=-1)
+
+        embeddings_projections = torch.stack(
+            list(map(lambda p: p(contexts_from), self.projections[1:]))
+        )
+        embeddings_projections = torch.nn.functional.normalize(embeddings_projections, p=2, dim=-1)
+
+        # assume both are l2-normalized -> cosine similarity
+        predictions_to = torch.einsum("tac,btc->tab", embeddings_projections, embeddings_to)
+
+        batch_loss = []
+        for idx, ahead in enumerate(
+            range(self.num_ahead_subsampling, self.num_ahead, self.num_ahead_subsampling)
+        ):
+            predictions_to_ahead = predictions_to[idx]
 
             has_value_to = torch.from_numpy((from_timesteps_reduced + ahead) < valid_lengths).to(
-                X_emb.device
+                X_emb.device, non_blocking=True
             )
-            loss = nt_xent_loss(predictions_to, has_value_to)
+            loss = nt_xent_loss(predictions_to_ahead, has_value_to)
             loss_mean = torch.mean(loss)
 
             batch_loss.append(loss_mean)
@@ -218,10 +353,12 @@ class CPC(torch.nn.Module):
 
         return batch_loss
 
-    def get_contexts(self, X, device="cpu"):
-        embedder = self.embedder.eval()
-        contexter = self.contexter.eval()
+    def apply_contexter(self, X_emb, device="cpu"):
+        contexts = self.contexter(X_emb)
 
+        return contexts
+
+    def get_contexts(self, X, device="cpu"):
         contexts = []
         with torch.no_grad():
             bar = progress_bar(range(len(X)))
@@ -230,46 +367,58 @@ class CPC(torch.nn.Module):
                 if self.reverse_time:
                     x = x[::-1]
 
-                x = torch.transpose(torch.from_numpy(x[None, :, :]), 2, 1).to(device)
-                x_emb = embedder(x)
+                x = torch.transpose(torch.from_numpy(x[None, :, :]), 2, 1).to(
+                    device, non_blocking=True
+                )
+                x_emb = self.embedder(x)
+                c = self.apply_contexter(x_emb, device)
 
-                c, _ = contexter(x_emb.transpose(2, 1))
-
-                contexts.append(c.cpu().numpy()[0])
+                contexts.append(c.cpu().numpy())
 
         contexts = np.concatenate(contexts)
         return contexts
 
-    def forward(self, X_batch, Y_batch=None, device="cpu", with_loss=False):
+    def forward(
+        self,
+        X_batch,
+        Y_batch=None,
+        device="cpu",
+        with_loss=False,
+        min_from_timesteps=0,
+        subsample_from_rand=None,
+    ):
         batch_size = len(X_batch)
 
+        """
         if self.reverse_time:
-            X_batch = [x[::-1] for x in X_batch]
+            X_batch = numba.typed.List([x[::-1] for x in X_batch])
 
             if Y_batch is not None:
-                Y_batch = [y[::-1] for y in Y_batch]
+                Y_batch = numba.typed.List([y[::-1] for y in Y_batch])
+        """
 
-        X_batch, Y_batch, valid_lengths = self.subsample_and_pad(X_batch, Y_batch, device)
+        X_batch, Y_batch, valid_lengths = self.subsample_and_pad(
+            X_batch, Y_batch, device, subsample_from_rand=subsample_from_rand
+        )
 
         X_emb = self.embedder(X_batch)
+        crop = (Y_batch.shape[-1] - X_emb.shape[-1]) // 2
+        valid_lengths -= crop
+        if Y_batch is not None:
+            Y_batch = Y_batch[:, crop:-crop]
 
-        max_from_timesteps = [x.shape[-1] - self.num_ahead for x in X_emb]
+        max_from_timesteps = [x.shape[-1] - (self.num_ahead + crop) for x in X_emb]
         from_timesteps = np.random.randint(
-            low=0,
+            low=min_from_timesteps,
             high=max_from_timesteps,
             size=batch_size,
         )
-        # contexts, _ = self.contexter(X_emb[:, :, : max(from_timesteps) + 1].transpose(2, 1))
-        rnn_input = X_emb.permute(2, 0, 1)
-        states = [
-            mabe.custom_lstms.LSTMState(
-                torch.randn(batch_size, self.num_context, device=device),
-                torch.randn(batch_size, self.num_context, device=device),
-            )
-            for _ in range(self.num_rnn_layers)
-        ]
-        contexts, _ = self.contexter(rnn_input, states)
-        contexts = contexts.transpose(1, 0)
+
+        contexts = self.apply_contexter(X_emb, device).transpose(2, 1)
+        crop = Y_batch.shape[-1] - contexts.shape[-2]
+        valid_lengths -= crop
+        if Y_batch is not None:
+            Y_batch = Y_batch[:, crop:]
 
         if with_loss:
             batch_loss = self.cpc_loss(X_emb, contexts, from_timesteps, valid_lengths)
