@@ -91,7 +91,7 @@ def get_movement_velocity_orienation(mouse):
     return velocity, orientation_change
 
 
-def transform_to_feature_vector(trajectory, with_abs_pos=False, with_pca=True):
+def transform_to_feature_vector(trajectory, with_abs_pos=False, with_pca=False):
     m0 = trajectory[:, 0, :, :].copy()
     m1 = trajectory[:, 1, :, :].copy()
     velocity, orientation = get_movement_velocity_orienation(m0)
@@ -115,19 +115,25 @@ def transform_to_feature_vector(trajectory, with_abs_pos=False, with_pca=True):
     features = np.concatenate(
         (m0[1:], m1[1:], velocity, orientation, relative_position_info[1:]), axis=1
     )
-    return features
+
+    indices = np.arange(0, velocity.shape[0])
+    is_beginning = np.clip(indices / 2000, 0, 1).reshape(-1, 1)
+    is_ending = np.clip((velocity.shape[0] - indices) / 16000, 0, 1).reshape(-1, 1)
+
+    extra_features = np.concatenate((is_beginning, is_ending), axis=1)
+
+    return features, extra_features
 
 
 def get_features_and_labels(sample_sequence):
-
-    features = transform_to_feature_vector(sample_sequence["keypoints"])
+    features, extra_features = transform_to_feature_vector(sample_sequence["keypoints"])
     if "annotations" in sample_sequence:
         labels = sample_sequence["annotations"]
         labels = labels[1:]
     else:
         labels = np.array([-1] * features.shape[0])
 
-    return features, labels
+    return features, extra_features, labels
 
 
 def load_dataset(path):
@@ -138,23 +144,25 @@ def load_dataset(path):
     raw_data = raw_data["sequences"]
 
     X = []
+    X_extra = []
     Y = []
     groups = []
 
     for key, data in progress_bar(raw_data.items()):
-        x, y = get_features_and_labels(data)
+        x, x_extra, y = get_features_and_labels(data)
         X.append(x)
+        X_extra.append(x_extra)
         Y.append(y)
         groups.append(key)
 
-    return X, Y, groups
+    return X, X_extra, Y, groups
 
 
 # %% codecell
-X, Y, groups = load_dataset(train_path)
+X, X_extra, Y, groups = load_dataset(train_path)
 
 # %% codecell
-X_test, Y_test, groups_test = load_dataset(test_path)
+X_test, X_extra_test, Y_test, groups_test = load_dataset(test_path)
 
 # %%
 """
@@ -191,9 +199,11 @@ with h5py.File(feature_path, "w") as hdf:
             grp[f"{idx:04d}"] = v
 
     store("train/x", X)
+    store("train/x_extra", X_extra)
     store("train/y", Y)
     store("train/groups", groups)
 
     store("test/x", X_test)
+    store("test/x_extra", X_extra_test)
     store("test/y", Y_test)
     store("test/groups", groups_test)
