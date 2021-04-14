@@ -1,10 +1,16 @@
 import math
+from typing import List, Tuple
 
 import numba
 import numpy as np
 import torch
+import torchtyping
 from fastprogress.fastprogress import force_console_behavior
+from torchtyping import TensorType  # type: ignore
 
+from mabe.types import batch, channels, time
+
+torchtyping.patch_typeguard()
 master_bar, progress_bar = force_console_behavior()
 
 
@@ -30,7 +36,9 @@ class CausalConv1D(torch.nn.Module):
             **conv1d_kwargs,
         )
 
-    def forward(self, x):
+    def forward(
+        self, x: TensorType["batch", "channels", "time", float]
+    ) -> TensorType["batch", "channels", "time", float]:
         x = self.conv(x)
 
         # remove trailing padding
@@ -57,7 +65,9 @@ class ResidualBlock(torch.nn.Module):
         self.layer_norm1 = torch.nn.LayerNorm(channels) if layer_norm else None
         self.layer_norm2 = torch.nn.LayerNorm(channels) if layer_norm else None
 
-    def forward(self, x):
+    def forward(
+        self, x: TensorType["batch", "channels", "time", float]
+    ) -> TensorType["batch", "channels", "time", float]:
         x_ = x
 
         if self.layer_norm:
@@ -110,7 +120,9 @@ class Embedder(torch.nn.Module):
             ],
         )
 
-    def forward(self, x):
+    def forward(
+        self, x: TensorType["batch", "channels", "time", float]
+    ) -> TensorType["batch", "channels", "time", float]:
         x = self.input_dropout(x)
         x = self.head(x)
         x = self.head_dropout(x)
@@ -131,7 +143,9 @@ class CausalResidualBlock(torch.nn.Module):
         self.layer_norm1 = torch.nn.LayerNorm(channels) if layer_norm else None
         self.layer_norm2 = torch.nn.LayerNorm(channels) if layer_norm else None
 
-    def forward(self, x):
+    def forward(
+        self, x: TensorType["batch", "channels", "time", float]
+    ) -> TensorType["batch", "channels", "time", float]:
         x_ = x
 
         if self.layer_norm:
@@ -166,7 +180,9 @@ class Contexter(torch.nn.Module):
         )
         self.dropout = torch.nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(
+        self, x: TensorType["batch", "channels", "time", float]
+    ) -> TensorType["batch", "channels", "time", float]:
         x = self.head(x)
         x = self.convolutions(x)
         x = self.dropout(x)
@@ -234,6 +250,7 @@ class ConvCPC(torch.nn.Module):
         head_dropout=0,
         dropout=0,
         reverse_time=False,
+        num_extra_features=0,
         **kwargs,
     ):
         super().__init__()
@@ -241,6 +258,7 @@ class ConvCPC(torch.nn.Module):
         self.num_embeddings = num_embeddings
         self.num_context = num_context
         self.num_features = num_features
+        self.num_extra_features = num_extra_features
         self.split_idx = split_idx
 
         self.embedder = Embedder(
@@ -277,7 +295,18 @@ class ConvCPC(torch.nn.Module):
                 if m.bias is not None:
                     torch.nn.init.zeros_(m.bias)
 
-    def random_subsample(self, X, Y=None, subsample_from_rand=None):
+    def random_subsample(
+        self,
+        X: List[TensorType["time", "channels", float]],
+        X_extra: List[TensorType["time", "channels", float]] = None,
+        Y: List[TensorType["time", int]] = None,
+        subsample_from_rand: TensorType["batch"] = None,
+    ) -> Tuple[
+        TensorType["batch", "time", "channels", float],
+        TensorType["batch", "time", "channels", float],
+        TensorType["batch", "time", int],
+        TensorType["batch", int],
+    ]:
         batch_size = len(X)
         if subsample_from_rand is None:
             subsample_from_rand = np.random.rand(batch_size)
@@ -287,24 +316,60 @@ class ConvCPC(torch.nn.Module):
         valid_lengths = np.zeros(batch_size, dtype=np.int)
         subsample(X, X_, valid_lengths, combined_length, subsample_from_rand, self.reverse_time)
 
+        X_extra_ = None
+        if X_extra is not None:
+            X_extra_ = np.zeros(
+                (batch_size, combined_length, self.num_extra_features), dtype=np.float32
+            )
+            subsample(
+                X_extra,
+                X_extra_,
+                valid_lengths,
+                combined_length,
+                subsample_from_rand,
+                self.reverse_time,
+            )
+
+        Y_ = None
         if Y is not None:
             Y_ = np.full((batch_size, combined_length), -1, dtype=np.int)
             subsample(Y, Y_, valid_lengths, combined_length, subsample_from_rand, self.reverse_time)
-        else:
-            Y_ = None
 
-        return X_, Y_, valid_lengths
+        return X_, X_extra_, Y_, valid_lengths
 
-    def subsample_and_pad(self, X, Y=None, device="cpu", subsample_from_rand=None):
-        X, Y, valid_lengths = self.random_subsample(X, Y, subsample_from_rand=subsample_from_rand)
+    def subsample_and_pad(
+        self,
+        X: List[TensorType["time", "channels", float]],
+        X_extra: List[TensorType["time", "channels", float]] = None,
+        Y: List[TensorType["time", int]] = None,
+        device: str = "cpu",
+        subsample_from_rand: TensorType["batch", int] = None,
+    ) -> Tuple[
+        TensorType["batch", "time", "channels", float],
+        TensorType["batch", "time", "channels", float],
+        TensorType["batch", "time", int],
+        TensorType["batch", int],
+    ]:
+        X, X_extra, Y, valid_lengths = self.random_subsample(
+            X, X_extra, Y, subsample_from_rand=subsample_from_rand
+        )
         X = torch.transpose(torch.from_numpy(X), 2, 1).to(device, non_blocking=True)
+
+        if X_extra is not None:
+            X_extra = torch.from_numpy(X_extra).to(device, non_blocking=True)
 
         if Y is not None:
             Y = torch.from_numpy(Y).to(device, non_blocking=True)
 
-        return X, Y, valid_lengths
+        return X, X_extra, Y, valid_lengths
 
-    def cpc_loss(self, X_emb, contexts, from_timesteps, valid_lengths):
+    def cpc_loss(
+        self,
+        X_emb: TensorType["batch", "time", "channels", float],
+        contexts: TensorType["batch", "time", "channels", float],
+        from_timesteps: TensorType["batch", int],
+        valid_lengths: TensorType["batch", int],
+    ) -> TensorType[float]:
         batch_size = len(contexts)
 
         from_timesteps_reduced = from_timesteps
@@ -349,9 +414,9 @@ class ConvCPC(torch.nn.Module):
 
             batch_loss.append(loss_mean)
 
-        batch_loss = sum(batch_loss) / len(batch_loss)
+        aggregated_batch_loss = sum(batch_loss) / len(batch_loss)
 
-        return batch_loss
+        return aggregated_batch_loss
 
     def apply_contexter(self, X_emb, device="cpu"):
         contexts = self.contexter(X_emb)
@@ -380,12 +445,13 @@ class ConvCPC(torch.nn.Module):
 
     def forward(
         self,
-        X_batch,
-        Y_batch=None,
-        device="cpu",
-        with_loss=False,
-        min_from_timesteps=0,
-        subsample_from_rand=None,
+        X_batch: List[TensorType["time", "channels", float]],
+        Y_batch: List[TensorType["time", int]] = None,
+        device: str = "cpu",
+        with_loss: bool = False,
+        min_from_timesteps: int = 0,
+        subsample_from_rand: TensorType["batch", int] = None,
+        X_extra_batch: List[TensorType["time", "channels", float]] = None,
     ):
         batch_size = len(X_batch)
 
@@ -397,15 +463,22 @@ class ConvCPC(torch.nn.Module):
                 Y_batch = numba.typed.List([y[::-1] for y in Y_batch])
         """
 
-        X_batch, Y_batch, valid_lengths = self.subsample_and_pad(
-            X_batch, Y_batch, device, subsample_from_rand=subsample_from_rand
+        (
+            X_batch_samples,
+            X_extra_batch_samples,
+            Y_batch_samples,
+            valid_lengths,
+        ) = self.subsample_and_pad(
+            X_batch, X_extra_batch, Y_batch, device, subsample_from_rand=subsample_from_rand
         )
 
-        X_emb = self.embedder(X_batch)
-        crop = (Y_batch.shape[-1] - X_emb.shape[-1]) // 2
+        X_emb = self.embedder(X_batch_samples)
+        crop = (Y_batch_samples.shape[-1] - X_emb.shape[-1]) // 2
         valid_lengths -= crop
-        if Y_batch is not None:
-            Y_batch = Y_batch[:, crop:-crop]
+        if X_extra_batch_samples is not None:
+            X_extra_batch_samples = X_extra_batch_samples[:, crop:-crop]
+        if Y_batch_samples is not None:
+            Y_batch_samples = Y_batch_samples[:, crop:-crop]
 
         max_from_timesteps = [x.shape[-1] - (self.num_ahead + crop) for x in X_emb]
         from_timesteps = np.random.randint(
@@ -415,13 +488,15 @@ class ConvCPC(torch.nn.Module):
         )
 
         contexts = self.apply_contexter(X_emb, device).transpose(2, 1)
-        crop = Y_batch.shape[-1] - contexts.shape[-2]
+        crop = Y_batch_samples.shape[-1] - contexts.shape[-2]
         valid_lengths -= crop
-        if Y_batch is not None:
-            Y_batch = Y_batch[:, crop:]
+        if X_extra_batch_samples is not None:
+            X_extra_batch_samples = X_extra_batch_samples[:, crop:]
+        if Y_batch_samples is not None:
+            Y_batch_samples = Y_batch_samples[:, crop:]
 
         if with_loss:
             batch_loss = self.cpc_loss(X_emb, contexts, from_timesteps, valid_lengths)
-            return contexts, Y_batch, batch_loss
+            return contexts, X_extra_batch_samples, Y_batch_samples, batch_loss
         else:
-            return contexts, Y_batch
+            return contexts, X_extra_batch_samples, Y_batch_samples

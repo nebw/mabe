@@ -24,15 +24,31 @@ class DataWrapper:
             self.test_X = load_all("test/x")
             self.test_Y = load_all("test/y")
 
+            try:
+                self.train_X_extra = load_all("train/x_extra")
+                self.test_X_extra = load_all("test/x_extra")
+            except KeyError:
+                self.train_X_extra = None
+                self.test_X_extra = None
+
             self.test_groups = list(map(lambda v: v[()], hdf["test/groups"].values()))
 
         self.X = self.train_X + self.test_X
         self.Y = self.train_Y + self.test_Y
 
+        if self.train_X_extra is not None:
+            self.X_extra = self.train_X_extra + self.test_X_extra
+            self.num_extra_features = self.X_extra[0].shape[-1]
+        else:
+            self.X_extra = None
+            self.num_extra_features = 0
+
         scaler = sklearn.preprocessing.StandardScaler().fit(np.concatenate(self.X))
         self.X = list(map(lambda x: scaler.transform(x), self.X))
         self.X_train = list(map(lambda x: scaler.transform(x), self.train_X))
         self.X_test = list(map(lambda x: scaler.transform(x), self.test_X))
+        self.X_extra_train = self.train_X_extra
+        self.X_extra_test = self.test_X_extra
 
         self.sample_lengths = np.array(list(map(len, self.X)))
 
@@ -88,7 +104,7 @@ class CVSplit:
         _, class_counts = np.unique(np.concatenate(data.train_Y).astype(np.int), return_counts=True)
         self.p_class = class_counts / np.sum(class_counts)
 
-    def get_train_batch(self, batch_size, random_noise=0.0):
+    def get_train_batch(self, batch_size, random_noise=0.0, extra_features=False):
         indices_batch = np.concatenate(
             (
                 np.random.choice(
@@ -108,4 +124,9 @@ class CVSplit:
         Y_batch = numba.typed.List()
         [Y_batch.append(self.data.Y[i].astype(int)) for i in indices_batch]
 
-        return X_batch, Y_batch, indices_batch
+        X_extra_batch = None
+        if extra_features:
+            X_extra_batch = numba.typed.List()
+            [X_extra_batch.append(self.data.X_extra[i].astype(int)) for i in indices_batch]
+
+        return X_batch, Y_batch, indices_batch, X_extra_batch

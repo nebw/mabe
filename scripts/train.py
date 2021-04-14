@@ -21,7 +21,7 @@ import mabe.ringbuffer
 import mabe.training
 
 
-def predict_test_data(cpc, logreg, data, device):
+def predict_test_data(cpc, logreg, data, device, config):
     cpc = cpc.eval()
     logreg = logreg.eval()
 
@@ -35,6 +35,11 @@ def predict_test_data(cpc, logreg, data, device):
             crop_post = 0
 
             x = data.X_test[idx].astype(np.float32)
+            x_extra = None
+            if config.use_extra_features:
+                x_extra = data.X_extra_test[idx].astype(np.float32)
+                x_extra = torch.from_numpy(x_extra).to(device, non_blocking=True)
+
             g = data.test_groups[idx]
 
             x = torch.transpose(torch.from_numpy(x[None, :, :]), 2, 1).to(device, non_blocking=True)
@@ -45,10 +50,17 @@ def predict_test_data(cpc, logreg, data, device):
             crop_post += crop
 
             c = cpc.apply_contexter(x_emb, device)
-            l = logreg(c[0].T)
 
             crop = x_emb.shape[-1] - c.shape[-1]
             crop_pre += crop
+
+            logreg_features = c[0].T
+            if config.use_extra_features:
+                # TODO: check
+                x_extra = x_extra[crop_pre : -(crop_post - 1)]
+                logreg_features = torch.cat((logreg_features, x_extra), dim=-1)
+
+            l = logreg(logreg_features)
 
             l = torch.cat((l[:1].repeat(crop_pre, 1), l, l[-1:].repeat(crop_post, 1)), dim=0)
             p = torch.argmax(l, dim=-1)
@@ -77,11 +89,12 @@ def train_model(config, data, split, device):
         head_dropout=config.head_dropout,
         dropout=config.dropout,
         split_idx=config.split_idx,
+        num_extra_features=data.num_extra_features,
     ).to(device)
 
     logreg = torch.nn.Sequential(
-        torch.nn.LayerNorm(config.num_context),
-        torch.nn.Linear(config.num_context, 4),
+        torch.nn.LayerNorm(config.num_context + data.num_extra_features),
+        torch.nn.Linear(config.num_context + data.num_extra_features, 4),
     )
     logreg = logreg.to(device)
 
@@ -130,7 +143,7 @@ def train_model(config, data, split, device):
     clf_val_f1s = []
     best_params = None
 
-    best_val_f1 = mabe.training.validation_f1(cpc, logreg, data, split, device)
+    best_val_f1 = mabe.training.validation_f1(cpc, logreg, data, split, device, config)
     clf_val_f1s.append(best_val_f1)
 
     def get_lr(optimizer):
@@ -148,19 +161,26 @@ def train_model(config, data, split, device):
             optimizer.zero_grad()
             cpc = cpc.train()
 
-            X_batch, Y_batch, indices_batch = split.get_train_batch(
-                config.batch_size, random_noise=config.augmentation_random_noise
+            X_batch, Y_batch, indices_batch, X_extra_batch = split.get_train_batch(
+                config.batch_size,
+                random_noise=config.augmentation_random_noise,
+                extra_features=config.use_extra_features,
             )
 
-            contexts, Y_batch, batch_loss = cpc(X_batch, Y_batch, device=device, with_loss=True)
+            contexts, X_extra_batch, Y_batch, batch_loss = cpc(
+                X_batch, Y_batch, device=device, with_loss=True, X_extra_batch=X_extra_batch
+            )
             losses.append(batch_loss.cpu().item())
 
             has_train_labels = [i in split.train_indices_labeled for i in indices_batch]
             Y_batch_flat = Y_batch[has_train_labels].flatten().long()
             valids = Y_batch_flat >= 0
             if torch.any(valids):
+                logreg_features = torch.cat(
+                    (contexts[has_train_labels], X_extra_batch[has_train_labels]), dim=-1
+                )
                 clf_batch_loss = clf_loss(
-                    logreg(contexts[has_train_labels]).reshape(-1, 4),
+                    logreg(logreg_features).reshape(-1, 4),
                     Y_batch[has_train_labels].flatten().long(),
                 )
 
@@ -174,7 +194,7 @@ def train_model(config, data, split, device):
 
                 bar.comment = f"Train: {running(losses):.3f} | CLF Train: {running(clf_losses):.3f} | Best CLF Val F1: {best_val_f1:.3f} | LR: {get_lr(optimizer):.4f}"
 
-        val_f1 = mabe.training.validation_f1(cpc, logreg, data, split, device)
+        val_f1 = mabe.training.validation_f1(cpc, logreg, data, split, device, config)
         clf_val_f1s.append(val_f1)
 
         get_cpu_params = lambda model: copy.deepcopy(
@@ -185,7 +205,7 @@ def train_model(config, data, split, device):
             best_val_f1 = val_f1
             best_params = (get_cpu_params(cpc), get_cpu_params(logreg))
 
-    test_predictions, test_logits = predict_test_data(cpc, logreg, data, device)
+    test_predictions, test_logits = predict_test_data(cpc, logreg, data, device, config)
 
     result = mabe.training.TrainingResult(
         config=config,
