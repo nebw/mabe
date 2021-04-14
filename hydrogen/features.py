@@ -15,9 +15,10 @@ import mabe.config
 master_bar, progress_bar = force_console_behavior()
 
 train_path = mabe.config.ROOT_PATH / "train.npy"
+train_task2_path = mabe.config.ROOT_PATH / "train_task2.npy"
 test_path = mabe.config.ROOT_PATH / "test-release.npy"
 pca_path = mabe.config.ROOT_PATH / "pose-pca.joblib"
-feature_path = mabe.config.ROOT_PATH / "features_pca.hdf5"
+feature_path = mabe.config.ROOT_PATH / "features_task12.hdf5"
 
 # %% codecell
 pose_pca = joblib.load(pca_path)
@@ -130,10 +131,12 @@ def get_features_and_labels(sample_sequence):
     if "annotations" in sample_sequence:
         labels = sample_sequence["annotations"]
         labels = labels[1:]
+        annotator = sample_sequence["annotator_id"]
     else:
         labels = np.array([-1] * features.shape[0])
+        annotator = None
 
-    return features, extra_features, labels
+    return features, extra_features, labels, annotator
 
 
 def load_dataset(path):
@@ -147,22 +150,31 @@ def load_dataset(path):
     X_extra = []
     Y = []
     groups = []
+    annotators = []
 
     for key, data in progress_bar(raw_data.items()):
-        x, x_extra, y = get_features_and_labels(data)
+        x, x_extra, y, annotator = get_features_and_labels(data)
         X.append(x)
         X_extra.append(x_extra)
         Y.append(y)
         groups.append(key)
+        annotators.append(annotator)
 
-    return X, X_extra, Y, groups
+    return X, X_extra, Y, groups, annotators
 
-
-# %% codecell
-X, X_extra, Y, groups = load_dataset(train_path)
 
 # %% codecell
-X_test, X_extra_test, Y_test, groups_test = load_dataset(test_path)
+X, X_extra, Y, groups, annotators = load_dataset(train_path)
+Xt2, Xt2_extra, Yt2, groupst2, annotatorst2 = load_dataset(train_task2_path)
+
+X += Xt2
+X_extra += Xt2_extra
+Y += Yt2
+groups += groupst2
+annotators += annotatorst2
+
+# %% codecell
+X_test, X_extra_test, Y_test, groups_test, _ = load_dataset(test_path)
 
 # %%
 """
@@ -202,6 +214,7 @@ with h5py.File(feature_path, "w") as hdf:
     store("train/x_extra", X_extra)
     store("train/y", Y)
     store("train/groups", groups)
+    store("train/annotators", annotators)
 
     store("test/x", X_test)
     store("test/x_extra", X_extra_test)
