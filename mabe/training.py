@@ -19,6 +19,7 @@ def validation_f1(cpc, logreg, data, split, device, config):
                     x_extra = data.X_extra_train[idx].astype(np.float32)
                     x_extra = torch.from_numpy(x_extra).to(device, non_blocking=True)
                 y = data.train_Y[idx]
+                a = np.array([data.train_annotators[idx]]).repeat(len(y))
 
                 x = torch.transpose(torch.from_numpy(x[None, :, :]), 2, 1).to(
                     device, non_blocking=True
@@ -27,19 +28,20 @@ def validation_f1(cpc, logreg, data, split, device, config):
 
                 crop = (y.shape[-1] - x_emb.shape[-1]) // 2
                 y = y[crop:-crop]
-                x_extra = x_extra[crop:-crop]
+                a = a[crop:-crop]
+                if config.use_extra_features:
+                    x_extra = x_extra[crop:-crop]
 
                 c = cpc.apply_contexter(x_emb, device)
 
                 crop = len(y) - c.shape[-1]
                 y = y[crop:]
-                x_extra = x_extra[crop:]
+                a = a[crop:]
+                if config.use_extra_features:
+                    x_extra = x_extra[crop:]
 
                 logreg_features = c[0].T
-                if config.use_extra_features:
-                    logreg_features = torch.cat((logreg_features, x_extra), dim=-1)
-
-                l = logreg(logreg_features)
+                l = logreg(logreg_features, x_extra, a)
                 p = torch.argmax(l, dim=-1)
 
                 predictions.append(p.cpu().numpy())

@@ -558,9 +558,11 @@ def macro_f1_score(y_true, y_pred, n_labels):
         tpfp = np.sum(yp)
         tpfn = np.sum(yt)
         if tpfp == 0:
+            """
             print(
                 "[WARNING] F-score is ill-defined and being set to 0.0 in labels with no predicted samples."
             )
+            """
             precision = 0.0
         else:
             precision = tp / tpfp

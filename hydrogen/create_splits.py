@@ -21,7 +21,7 @@ num_splits = 10
 master_bar, progress_bar = force_console_behavior()
 
 # %%
-feature_path = mabe.config.ROOT_PATH / "features.hdf5"
+feature_path = mabe.config.ROOT_PATH / "features_task12.hdf5"
 
 # %%
 with h5py.File(feature_path, "r") as hdf:
@@ -31,6 +31,9 @@ with h5py.File(feature_path, "r") as hdf:
 
     train_X = load_all("train/x")
     train_Y = load_all("train/y")
+
+    train_annotators = np.array(list(map(lambda v: v[()], hdf["train/annotators"].values())))
+    num_annotators = len(np.unique(train_annotators))
 
     test_X = load_all("test/x")
     test_Y = load_all("test/y")
@@ -52,12 +55,17 @@ p_draw = sample_lengths / np.sum(sample_lengths)
 min(sample_lengths), max(sample_lengths)
 
 # %%
-for i in range(1, num_splits):
+for i in range(0, num_splits):
     indices_tr = np.arange(len(X_train))
     indices_te = len(X_train) + np.arange(len(X_test))
     indices = np.arange(len(X))
 
-    train_indices_labeled = np.random.choice(indices_tr, int(0.8 * len(X_train)), replace=False)
+    # sample until the train split has at least one sample from each annotator
+    valid = False
+    while not valid:
+        train_indices_labeled = np.random.choice(indices_tr, int(0.8 * len(X_train)), replace=False)
+        valid = len(np.unique(train_annotators[train_indices_labeled])) == num_annotators
+
     train_indices_unlabeled = np.random.choice(indices_te, int(0.8 * len(X_test)), replace=False)
     train_indices = np.concatenate((train_indices_labeled, train_indices_unlabeled))
     val_indices_labeled = np.array([i for i in indices_tr if i not in train_indices_labeled])

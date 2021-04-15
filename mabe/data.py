@@ -1,3 +1,4 @@
+import dataclasses
 import pickle
 
 import h5py
@@ -7,6 +8,15 @@ import sklearn
 import sklearn.preprocessing
 
 import mabe.config
+
+
+@dataclasses.dataclass
+class TrainingBatch:
+    X: numba.typed.List[np.array]
+    X_extra: numba.typed.List[np.array]
+    Y: numba.typed.List[np.array]
+    indices: np.array
+    annotators: numba.typed.List[np.array]
 
 
 class DataWrapper:
@@ -21,8 +31,12 @@ class DataWrapper:
             self.train_X = load_all("train/x")
             self.train_Y = load_all("train/y")
 
+            self.train_annotators = list(map(lambda v: v[()], hdf["train/annotators"].values()))
+
             self.test_X = load_all("test/x")
             self.test_Y = load_all("test/y")
+
+            self.test_annotators = [-1] * len(self.test_X)
 
             try:
                 self.train_X_extra = load_all("train/x_extra")
@@ -35,6 +49,8 @@ class DataWrapper:
 
         self.X = self.train_X + self.test_X
         self.Y = self.train_Y + self.test_Y
+        self.annotators = self.train_annotators + self.test_annotators
+        self.num_annotators = len(np.unique(self.train_annotators))
 
         if self.train_X_extra is not None:
             self.X_extra = self.train_X_extra + self.test_X_extra
@@ -124,9 +140,15 @@ class CVSplit:
         Y_batch = numba.typed.List()
         [Y_batch.append(self.data.Y[i].astype(int)) for i in indices_batch]
 
+        annotators_batch = numba.typed.List()
+        [
+            annotators_batch.append(np.array([self.data.annotators[i]]).repeat(len(y)))
+            for i, y in zip(indices_batch, Y_batch)
+        ]
+
         X_extra_batch = None
         if extra_features:
             X_extra_batch = numba.typed.List()
             [X_extra_batch.append(self.data.X_extra[i].astype(int)) for i in indices_batch]
 
-        return X_batch, Y_batch, indices_batch, X_extra_batch
+        return TrainingBatch(X_batch, X_extra_batch, Y_batch, indices_batch, annotators_batch)

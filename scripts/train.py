@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import collections
 import copy
 import datetime
 from typing import Union
@@ -25,8 +26,8 @@ def predict_test_data(cpc, logreg, data, device, config):
     cpc = cpc.eval()
     logreg = logreg.eval()
 
-    test_predictions = {}
-    test_logits = {}
+    test_predictions = collections.defaultdict(dict)
+    test_logits = collections.defaultdict(dict)
     with torch.no_grad():
         bar = progress_bar(range(len(data.X_test)))
         for idx in bar:
@@ -55,20 +56,20 @@ def predict_test_data(cpc, logreg, data, device, config):
             crop_pre += crop
 
             logreg_features = c[0].T
-            if config.use_extra_features:
-                # TODO: check
-                x_extra = x_extra[crop_pre : -(crop_post - 1)]
-                logreg_features = torch.cat((logreg_features, x_extra), dim=-1)
+            # TODO: check off-by-one
+            x_extra = x_extra[crop_pre : -(crop_post - 1)]
 
-            l = logreg(logreg_features)
+            for annotator in range(data.num_annotators):
+                a = np.array([annotator]).repeat(len(logreg_features))
+                l = logreg(logreg_features, x_extra, a)
 
-            l = torch.cat((l[:1].repeat(crop_pre, 1), l, l[-1:].repeat(crop_post, 1)), dim=0)
-            p = torch.argmax(l, dim=-1)
+                l = torch.cat((l[:1].repeat(crop_pre, 1), l, l[-1:].repeat(crop_post, 1)), dim=0)
+                p = torch.argmax(l, dim=-1)
 
-            assert len(p) == x.shape[-1] + 1
+                assert len(p) == x.shape[-1] + 1
 
-            test_predictions[g.decode("utf-8")] = p.cpu().data.numpy()
-            test_logits[g.decode("utf-8")] = l.cpu().data.numpy()
+                test_predictions[g.decode("utf-8")][annotator] = p.cpu().data.numpy()
+                test_logits[g.decode("utf-8")][annotator] = l.cpu().data.numpy()
 
     return test_predictions, test_logits
 
@@ -92,11 +93,9 @@ def train_model(config, data, split, device):
         num_extra_features=data.num_extra_features,
     ).to(device)
 
-    logreg = torch.nn.Sequential(
-        torch.nn.LayerNorm(config.num_context + data.num_extra_features),
-        torch.nn.Linear(config.num_context + data.num_extra_features, 4),
-    )
-    logreg = logreg.to(device)
+    logreg = mabe.model.MultiAnnotatorLogisticRegressionHead(
+        config.num_context, data.num_annotators, data.num_extra_features
+    ).to(device)
 
     optimizer = None
     if config.optimizer == "SGD":
@@ -117,8 +116,8 @@ def train_model(config, data, split, device):
 
     class_weights = sklearn.utils.class_weight.compute_class_weight(
         "balanced",
-        classes=np.unique(np.concatenate(data.train_Y).astype(np.int)),
-        y=np.concatenate(data.train_Y).astype(np.int),
+        classes=np.unique(np.concatenate(data.train_Y).astype(int)),
+        y=np.concatenate(data.train_Y).astype(int),
     )
 
     clf_loss = mabe.loss.CrossEntropyLoss(
@@ -161,26 +160,29 @@ def train_model(config, data, split, device):
             optimizer.zero_grad()
             cpc = cpc.train()
 
-            X_batch, Y_batch, indices_batch, X_extra_batch = split.get_train_batch(
+            batch = split.get_train_batch(
                 config.batch_size,
                 random_noise=config.augmentation_random_noise,
                 extra_features=config.use_extra_features,
             )
 
-            contexts, X_extra_batch, Y_batch, batch_loss = cpc(
-                X_batch, Y_batch, device=device, with_loss=True, X_extra_batch=X_extra_batch
+            contexts, X_extra_batch, Y_batch, annotators_batch, batch_loss = cpc(
+                batch, device=device, with_loss=True
             )
             losses.append(batch_loss.cpu().item())
 
-            has_train_labels = [i in split.train_indices_labeled for i in indices_batch]
+            has_train_labels = [i in split.train_indices_labeled for i in batch.indices]
+
             Y_batch_flat = Y_batch[has_train_labels].flatten().long()
             valids = Y_batch_flat >= 0
             if torch.any(valids):
-                logreg_features = torch.cat(
-                    (contexts[has_train_labels], X_extra_batch[has_train_labels]), dim=-1
-                )
+                logreg_features = contexts[has_train_labels]
+                annotators_batch = annotators_batch[has_train_labels]
+                if config.use_extra_features:
+                    X_extra_batch = X_extra_batch[has_train_labels]
+
                 clf_batch_loss = clf_loss(
-                    logreg(logreg_features).reshape(-1, 4),
+                    logreg(logreg_features, X_extra_batch, annotators_batch).reshape(-1, 4),
                     Y_batch[has_train_labels].flatten().long(),
                 )
 

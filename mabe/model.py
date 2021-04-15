@@ -8,6 +8,8 @@ import torchtyping
 from fastprogress.fastprogress import force_console_behavior
 from torchtyping import TensorType  # type: ignore
 
+import mabe
+import mabe.data
 from mabe.types import batch, channels, time
 
 torchtyping.patch_typeguard()
@@ -297,32 +299,33 @@ class ConvCPC(torch.nn.Module):
 
     def random_subsample(
         self,
-        X: List[TensorType["time", "channels", float]],
-        X_extra: List[TensorType["time", "channels", float]] = None,
-        Y: List[TensorType["time", int]] = None,
+        batch=mabe.data.TrainingBatch,
         subsample_from_rand: TensorType["batch"] = None,
     ) -> Tuple[
         TensorType["batch", "time", "channels", float],
         TensorType["batch", "time", "channels", float],
         TensorType["batch", "time", int],
+        TensorType["batch", "time", int],
         TensorType["batch", int],
     ]:
-        batch_size = len(X)
+        batch_size = len(batch.X)
         if subsample_from_rand is None:
             subsample_from_rand = np.random.rand(batch_size)
         combined_length = self.subsample_length + self.num_ahead
 
         X_ = np.zeros((batch_size, combined_length, self.num_features), dtype=np.float32)
         valid_lengths = np.zeros(batch_size, dtype=np.int)
-        subsample(X, X_, valid_lengths, combined_length, subsample_from_rand, self.reverse_time)
+        subsample(
+            batch.X, X_, valid_lengths, combined_length, subsample_from_rand, self.reverse_time
+        )
 
         X_extra_ = None
-        if X_extra is not None:
+        if batch.X_extra is not None:
             X_extra_ = np.zeros(
                 (batch_size, combined_length, self.num_extra_features), dtype=np.float32
             )
             subsample(
-                X_extra,
+                batch.X_extra,
                 X_extra_,
                 valid_lengths,
                 combined_length,
@@ -331,27 +334,39 @@ class ConvCPC(torch.nn.Module):
             )
 
         Y_ = None
-        if Y is not None:
+        if batch.Y is not None:
             Y_ = np.full((batch_size, combined_length), -1, dtype=np.int)
-            subsample(Y, Y_, valid_lengths, combined_length, subsample_from_rand, self.reverse_time)
+            subsample(
+                batch.Y, Y_, valid_lengths, combined_length, subsample_from_rand, self.reverse_time
+            )
 
-        return X_, X_extra_, Y_, valid_lengths
+        annotators_ = None
+        annotators_ = np.full((batch_size, combined_length), -1, dtype=np.int)
+        subsample(
+            batch.annotators,
+            annotators_,
+            valid_lengths,
+            combined_length,
+            subsample_from_rand,
+            self.reverse_time,
+        )
+
+        return X_, X_extra_, Y_, annotators_, valid_lengths
 
     def subsample_and_pad(
         self,
-        X: List[TensorType["time", "channels", float]],
-        X_extra: List[TensorType["time", "channels", float]] = None,
-        Y: List[TensorType["time", int]] = None,
+        batch=mabe.data.TrainingBatch,
         device: str = "cpu",
         subsample_from_rand: TensorType["batch", int] = None,
     ) -> Tuple[
         TensorType["batch", "time", "channels", float],
         TensorType["batch", "time", "channels", float],
         TensorType["batch", "time", int],
+        TensorType["batch", "time", int],
         TensorType["batch", int],
     ]:
-        X, X_extra, Y, valid_lengths = self.random_subsample(
-            X, X_extra, Y, subsample_from_rand=subsample_from_rand
+        X, X_extra, Y, annotators, valid_lengths = self.random_subsample(
+            batch, subsample_from_rand=subsample_from_rand
         )
         X = torch.transpose(torch.from_numpy(X), 2, 1).to(device, non_blocking=True)
 
@@ -361,7 +376,7 @@ class ConvCPC(torch.nn.Module):
         if Y is not None:
             Y = torch.from_numpy(Y).to(device, non_blocking=True)
 
-        return X, X_extra, Y, valid_lengths
+        return X, X_extra, Y, annotators, valid_lengths
 
     def cpc_loss(
         self,
@@ -445,15 +460,13 @@ class ConvCPC(torch.nn.Module):
 
     def forward(
         self,
-        X_batch: List[TensorType["time", "channels", float]],
-        Y_batch: List[TensorType["time", int]] = None,
+        batch: mabe.data.TrainingBatch,
         device: str = "cpu",
         with_loss: bool = False,
         min_from_timesteps: int = 0,
         subsample_from_rand: TensorType["batch", int] = None,
-        X_extra_batch: List[TensorType["time", "channels", float]] = None,
     ):
-        batch_size = len(X_batch)
+        batch_size = len(batch.X)
 
         """
         if self.reverse_time:
@@ -467,10 +480,9 @@ class ConvCPC(torch.nn.Module):
             X_batch_samples,
             X_extra_batch_samples,
             Y_batch_samples,
+            annotators_samples,
             valid_lengths,
-        ) = self.subsample_and_pad(
-            X_batch, X_extra_batch, Y_batch, device, subsample_from_rand=subsample_from_rand
-        )
+        ) = self.subsample_and_pad(batch, device, subsample_from_rand=subsample_from_rand)
 
         X_emb = self.embedder(X_batch_samples)
         crop = (Y_batch_samples.shape[-1] - X_emb.shape[-1]) // 2
@@ -479,6 +491,7 @@ class ConvCPC(torch.nn.Module):
             X_extra_batch_samples = X_extra_batch_samples[:, crop:-crop]
         if Y_batch_samples is not None:
             Y_batch_samples = Y_batch_samples[:, crop:-crop]
+        annotators_samples = annotators_samples[:, crop:-crop]
 
         max_from_timesteps = [x.shape[-1] - (self.num_ahead + crop) for x in X_emb]
         from_timesteps = np.random.randint(
@@ -494,9 +507,70 @@ class ConvCPC(torch.nn.Module):
             X_extra_batch_samples = X_extra_batch_samples[:, crop:]
         if Y_batch_samples is not None:
             Y_batch_samples = Y_batch_samples[:, crop:]
+        annotators_samples = annotators_samples[:, crop:]
 
         if with_loss:
             batch_loss = self.cpc_loss(X_emb, contexts, from_timesteps, valid_lengths)
-            return contexts, X_extra_batch_samples, Y_batch_samples, batch_loss
+            return contexts, X_extra_batch_samples, Y_batch_samples, annotators_samples, batch_loss
         else:
-            return contexts, X_extra_batch_samples, Y_batch_samples
+            return contexts, X_extra_batch_samples, Y_batch_samples, annotators_samples
+
+
+class MultiAnnotatorLogisticRegressionHead(torch.nn.Module):
+    def __init__(
+        self,
+        num_features,
+        num_annotators,
+        num_extra_features=0,
+        num_classes=4,
+        # annotator_embedding_size=32,
+    ):
+        super().__init__()
+
+        annotator_embedding_size = num_annotators
+
+        self.num_features_combined = num_features + num_extra_features
+
+        self.ln = torch.nn.LayerNorm(num_features)
+        self.logreg = torch.nn.Linear(self.num_features_combined, num_classes)
+
+        self.residual = torch.nn.Sequential(
+            torch.nn.Linear(
+                self.num_features_combined + annotator_embedding_size,
+                self.num_features_combined,
+            ),
+            torch.nn.LeakyReLU(),
+            torch.nn.Linear(
+                self.num_features_combined,
+                self.num_features_combined,
+            ),
+            torch.nn.LeakyReLU(),
+        )
+
+        self.embedding = torch.nn.Parameter((torch.diag(torch.ones(num_annotators))).detach())
+        self.register_parameter(name="embedding", param=self.embedding)
+
+        # TODO: init linear using label distribution
+        for m in self.modules():
+            if isinstance(m, torch.nn.LayerNorm):
+                torch.nn.init.constant_(m.weight, 1)
+                torch.nn.init.constant_(m.bias, 0)
+            elif isinstance(m, torch.nn.Linear):
+                torch.nn.init.normal_(m.weight, std=0.01)
+                if m.bias is not None:
+                    torch.nn.init.zeros_(m.bias)
+
+    def forward(self, x, x_extra, annotators):
+        assert np.all(annotators >= 0)
+
+        x = self.ln(x)
+        a = self.embedding[annotators.flatten()].reshape(*annotators.shape, -1)
+
+        x_ = torch.cat((x, x_extra, a), dim=-1)
+        x_ = self.residual(x_)
+
+        x = torch.cat((x, x_extra), dim=-1) + x_
+
+        logits = self.logreg(x)
+
+        return logits
