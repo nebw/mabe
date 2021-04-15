@@ -3,6 +3,7 @@
 import collections
 import copy
 import datetime
+import io
 from typing import Union
 
 import click
@@ -68,8 +69,12 @@ def predict_test_data(cpc, logreg, data, device, config):
 
                 assert len(p) == x.shape[-1] + 1
 
-                test_predictions[g.decode("utf-8")][annotator] = p.cpu().data.numpy()
-                test_logits[g.decode("utf-8")][annotator] = l.cpu().data.numpy()
+                with io.BytesIO() as buffer:
+                    np.savez_compressed(buffer, p.cpu().data.numpy())
+                    test_predictions[g.decode("utf-8")][annotator] = buffer.getvalue()
+                with io.BytesIO() as buffer:
+                    np.savez_compressed(buffer, l.cpu().data.numpy().astype(np.float32))
+                    test_logits[g.decode("utf-8")][annotator] = buffer.getvalue()
 
     return test_predictions, test_logits
 
