@@ -188,7 +188,12 @@ def train_model(config, data, split, device):
 
                 clf_batch_loss = clf_loss(
                     logreg(logreg_features, X_extra_batch, annotators_batch).reshape(-1, 4),
-                    Y_batch[has_train_labels].flatten().long(),
+                    Y_batch_flat,
+                )
+
+                assert np.all(
+                    (annotators_batch.flatten() >= 0)
+                    | ((annotators_batch.flatten() == -1) & (Y_batch_flat.cpu().data.numpy() == -1))
                 )
 
                 clf_losses.append(clf_batch_loss.cpu().item())

@@ -507,7 +507,7 @@ class ConvCPC(torch.nn.Module):
             X_extra_batch_samples = X_extra_batch_samples[:, crop:]
         if Y_batch_samples is not None:
             Y_batch_samples = Y_batch_samples[:, crop:]
-        annotators_samples = annotators_samples[:, crop:]
+            annotators_samples = annotators_samples[:, crop:]
 
         if with_loss:
             batch_loss = self.cpc_loss(X_emb, contexts, from_timesteps, valid_lengths)
@@ -561,8 +561,6 @@ class MultiAnnotatorLogisticRegressionHead(torch.nn.Module):
                     torch.nn.init.zeros_(m.bias)
 
     def forward(self, x, x_extra, annotators):
-        assert np.all(annotators >= 0)
-
         x = self.ln(x)
         a = self.embedding[annotators.flatten()].reshape(*annotators.shape, -1)
 

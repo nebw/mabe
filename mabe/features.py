@@ -1,30 +1,10 @@
-# %% codecell
-import h5py
-import joblib
-import matplotlib.pyplot as plt
 import numba
 import numpy as np
-import sklearn
-import sklearn.decomposition
 from fastprogress.fastprogress import force_console_behavior
 
-import mabe
-import mabe.config
-
-# %% codecell
 master_bar, progress_bar = force_console_behavior()
 
-train_path = mabe.config.ROOT_PATH / "train.npy"
-train_task2_path = mabe.config.ROOT_PATH / "train_task2.npy"
-train_task3_path = mabe.config.ROOT_PATH / "train_task3.npy"
-test_path = mabe.config.ROOT_PATH / "test-release.npy"
-pca_path = mabe.config.ROOT_PATH / "pose-pca.joblib"
-feature_path = mabe.config.ROOT_PATH / "features_task12.hdf5"
 
-# %% codecell
-pose_pca = joblib.load(pca_path)
-
-# %% codecell
 @numba.njit
 def get_mouse_orientation_angle(mouse):
     tail_coords = mouse[:, :, -1]
@@ -93,7 +73,7 @@ def get_movement_velocity_orienation(mouse):
     return velocity, orientation_change
 
 
-def transform_to_feature_vector(trajectory, with_abs_pos=False, with_pca=False):
+def transform_to_feature_vector(trajectory, with_abs_pos=False):
     m0 = trajectory[:, 0, :, :].copy()
     m1 = trajectory[:, 1, :, :].copy()
     velocity, orientation = get_movement_velocity_orienation(m0)
@@ -107,12 +87,6 @@ def transform_to_feature_vector(trajectory, with_abs_pos=False, with_pca=False):
 
     m0 = m0.reshape(-1, m0.shape[1] * m0.shape[2])
     m1 = m1.reshape(-1, m1.shape[1] * m1.shape[2])
-
-    if with_pca:
-        assert not with_abs_pos
-
-        m0 = pose_pca.transform(m0)
-        m1 = pose_pca.transform(m1)
 
     features = np.concatenate(
         (m0[1:], m1[1:], velocity, orientation, relative_position_info[1:]), axis=1
@@ -156,7 +130,7 @@ def load_dataset(path=None, raw_data=None):
     groups = []
     annotators = []
 
-    for key, data in progress_bar(raw_data.items()):
+    for key, data in raw_data.items():
         x, x_extra, y, annotator = get_features_and_labels(data)
         X.append(x)
         X_extra.append(x_extra)
@@ -173,67 +147,4 @@ def load_task3_datasets(path):
     for behavior_key in raw_data.keys():
         raw_data_behavior = raw_data[behavior_key]
 
-        yield load_dataset(raw_data=raw_data_behavior)
-
-
-# %%
-X, X_extra, Y, groups, annotators = next(load_task3_datasets(train_task3_path))
-
-
-# %% codecell
-X, X_extra, Y, groups, annotators = load_dataset(train_path)
-Xt2, Xt2_extra, Yt2, groupst2, annotatorst2 = load_dataset(train_task2_path)
-
-X += Xt2
-X_extra += Xt2_extra
-Y += Yt2
-groups += groupst2
-annotators += annotatorst2
-
-# %% codecell
-X_test, X_extra_test, Y_test, groups_test, _ = load_dataset(test_path)
-
-# %%
-"""
-X_m0 = np.concatenate([x[:, :14] for x in X])
-X_m1 = np.concatenate([x[:, 14:14+14] for x in X])
-X_test_m0 = np.concatenate([x[:, :14] for x in X_test])
-X_test_m1 = np.concatenate([x[:, 14:14+14] for x in X_test])
-mouse_poses = np.concatenate((X_m0, X_m1, X_test_m0, X_test_m1))
-
-pca = sklearn.decomposition.PCA(n_components=11)
-pca.fit(mouse_poses)
-
-joblib.dump(pca, pca_path)
-"""
-
-# %% codecell
-len(X), len(Y), len(groups)
-
-# %% codecell
-X[0].shape, X[1].shape, Y[0].shape
-
-# %% codecell
-len(X_test), len(Y_test), len(groups_test)
-
-# %% codecell
-X_test[0].shape, X_test[1].shape, Y_test[0].shape
-
-# %% codecell
-with h5py.File(feature_path, "w") as hdf:
-
-    def store(groupname, values):
-        grp = hdf.create_group(groupname)
-        for idx, v in enumerate(values):
-            grp[f"{idx:04d}"] = v
-
-    store("train/x", X)
-    store("train/x_extra", X_extra)
-    store("train/y", Y)
-    store("train/groups", groups)
-    store("train/annotators", annotators)
-
-    store("test/x", X_test)
-    store("test/x_extra", X_extra_test)
-    store("test/y", Y_test)
-    store("test/groups", groups_test)
+        yield behavior_key, load_dataset(raw_data=raw_data_behavior)

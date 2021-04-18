@@ -12,11 +12,11 @@ import mabe.config
 
 @dataclasses.dataclass
 class TrainingBatch:
-    X: numba.typed.List[np.array]
-    X_extra: numba.typed.List[np.array]
-    Y: numba.typed.List[np.array]
+    X: numba.typed.List  # [np.array]
+    X_extra: numba.typed.List  # [np.array]
+    Y: numba.typed.List  # [np.array]
     indices: np.array
-    annotators: numba.typed.List[np.array]
+    annotators: numba.typed.List  # [np.array]
 
 
 class DataWrapper:
