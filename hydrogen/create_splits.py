@@ -15,13 +15,13 @@ import mabe.model
 import mabe.ringbuffer
 
 # %%
-num_splits = 10
+num_splits = 32
 
 # %%
 master_bar, progress_bar = force_console_behavior()
 
 # %%
-feature_path = mabe.config.ROOT_PATH / "features_task12.hdf5"
+feature_path = mabe.config.ROOT_PATH / "features_task123.hdf5"
 
 # %%
 with h5py.File(feature_path, "r") as hdf:
@@ -29,52 +29,68 @@ with h5py.File(feature_path, "r") as hdf:
     def load_all(groupname):
         return list(map(lambda v: v[:].astype(np.float32), hdf[groupname].values()))
 
-    train_X = load_all("train/x")
-    train_Y = load_all("train/y")
+    X_labeled = load_all("train/x")
+    Y_labeled = load_all("train/y")
 
-    train_annotators = np.array(list(map(lambda v: v[()], hdf["train/annotators"].values())))
-    num_annotators = len(np.unique(train_annotators))
+    annotators_labeled = np.array(list(map(lambda v: v[()], hdf["train/annotators"].values())))
+    num_annotators = len(np.unique(annotators_labeled))
 
-    test_X = load_all("test/x")
-    test_Y = load_all("test/y")
-    test_groups = list(map(lambda v: v[()], hdf["test/groups"].values()))
+    clf_tasks_labeled = np.array(list(map(lambda v: v[()], hdf["train/clf_tasks"].values())))
+    num_clf_tasks = len(np.unique(clf_tasks_labeled))
+
+    X_unlabeled = load_all("test/x")
+    Y_unlabeled = load_all("test/y")
+    groups_unlabeled = list(map(lambda v: v[()], hdf["test/groups"].values()))
 
 # %%
-X = train_X + test_X
-Y = train_Y + test_Y
+X = X_labeled + X_unlabeled
+Y = Y_labeled + Y_unlabeled
 
 scaler = sklearn.preprocessing.StandardScaler().fit(np.concatenate(X))
 X = list(map(lambda x: scaler.transform(x), X))
-X_train = list(map(lambda x: scaler.transform(x), train_X))
-X_test = list(map(lambda x: scaler.transform(x), test_X))
+X_labeled = list(map(lambda x: scaler.transform(x), X_labeled))
+X_unlabeled = list(map(lambda x: scaler.transform(x), X_unlabeled))
 
 # %%
 sample_lengths = np.array(list(map(len, X)))
 p_draw = sample_lengths / np.sum(sample_lengths)
 
-min(sample_lengths), max(sample_lengths)
+len(X), len(X_labeled), min(sample_lengths), max(sample_lengths)
 
 # %%
 for i in range(0, num_splits):
-    indices_tr = np.arange(len(X_train))
-    indices_te = len(X_train) + np.arange(len(X_test))
+    indices_labeled = np.arange(len(X_labeled))
+    indices_unlabeled = len(X_labeled) + np.arange(len(X_unlabeled))
     indices = np.arange(len(X))
 
     # sample until the train split has at least one sample from each annotator
     valid = False
     while not valid:
-        train_indices_labeled = np.random.choice(indices_tr, int(0.8 * len(X_train)), replace=False)
-        valid = len(np.unique(train_annotators[train_indices_labeled])) == num_annotators
+        train_indices_labeled = np.random.choice(
+            indices_labeled, int(0.85 * len(X_labeled)), replace=False
+        )
+        val_indices_labeled = np.array(
+            [i for i in indices_labeled if i not in train_indices_labeled]
+        )
 
-    train_indices_unlabeled = np.random.choice(indices_te, int(0.8 * len(X_test)), replace=False)
+        valid = len(np.unique(annotators_labeled[train_indices_labeled])) == num_annotators
+        valid &= len(np.unique(clf_tasks_labeled[train_indices_labeled])) == num_clf_tasks
+        valid &= len(np.unique(clf_tasks_labeled[val_indices_labeled])) >= (
+            num_clf_tasks - 1
+        )  # one task with only one trajectory
+
+    train_indices_unlabeled = np.random.choice(
+        indices_unlabeled, int(0.85 * len(X_unlabeled)), replace=False
+    )
     train_indices = np.concatenate((train_indices_labeled, train_indices_unlabeled))
-    val_indices_labeled = np.array([i for i in indices_tr if i not in train_indices_labeled])
-    val_indices_unlabeled = np.array([i for i in indices_te if i not in train_indices_unlabeled])
+    val_indices_unlabeled = np.array(
+        [i for i in indices_unlabeled if i not in train_indices_unlabeled]
+    )
     val_indices = np.concatenate((val_indices_labeled, val_indices_unlabeled))
 
     split = dict(
-        indices_tr=indices_tr,
-        indices_te=indices_te,
+        indices_labeled=indices_labeled,
+        indices_unlabeled=indices_unlabeled,
         indices=indices,
         train_indices_labeled=train_indices_labeled,
         train_indices_unlabeled=train_indices_unlabeled,

@@ -17,6 +17,7 @@ class TrainingBatch:
     Y: numba.typed.List  # [np.array]
     indices: np.array
     annotators: numba.typed.List  # [np.array]
+    clf_tasks: np.array
 
 
 class DataWrapper:
@@ -28,32 +29,38 @@ class DataWrapper:
             def load_all(groupname):
                 return list(map(lambda v: v[:].astype(np.float32), hdf[groupname].values()))
 
-            self.train_X = load_all("train/x")
-            self.train_Y = load_all("train/y")
+            self.X_labeled = load_all("train/x")
+            self.Y_labeled = load_all("train/y")
 
-            self.train_annotators = list(map(lambda v: v[()], hdf["train/annotators"].values()))
+            self.annotators_labeled = list(map(lambda v: v[()], hdf["train/annotators"].values()))
+            self.clf_tasks_labeled = np.array(
+                list(map(lambda v: int(v[()]), hdf["train/clf_tasks"].values()))
+            )
 
-            self.test_X = load_all("test/x")
-            self.test_Y = load_all("test/y")
+            self.X_unlabeled = load_all("test/x")
+            self.Y_unlabeled = load_all("test/y")
 
-            self.test_annotators = [-1] * len(self.test_X)
+            self.annotators_unlabeled = [-1] * len(self.X_unlabeled)
+            self.clf_tasks_unlabeled = np.array([-1] * len(self.X_unlabeled))
 
             try:
-                self.train_X_extra = load_all("train/x_extra")
-                self.test_X_extra = load_all("test/x_extra")
+                self.X_labeled_extra = load_all("train/x_extra")
+                self.X_unlabeled_extra = load_all("test/x_extra")
             except KeyError:
-                self.train_X_extra = None
-                self.test_X_extra = None
+                self.X_labeled_extra = None
+                self.X_unlabeled_extra = None
 
-            self.test_groups = list(map(lambda v: v[()], hdf["test/groups"].values()))
+            self.groups_unlabeled = list(map(lambda v: v[()], hdf["test/groups"].values()))
 
-        self.X = self.train_X + self.test_X
-        self.Y = self.train_Y + self.test_Y
-        self.annotators = self.train_annotators + self.test_annotators
-        self.num_annotators = len(np.unique(self.train_annotators))
+        self.X = self.X_labeled + self.X_unlabeled
+        self.Y = self.Y_labeled + self.Y_unlabeled
+        self.annotators = self.annotators_labeled + self.annotators_unlabeled
+        self.num_annotators = len(np.unique(self.annotators_labeled))
+        self.clf_tasks = np.concatenate((self.clf_tasks_labeled, self.clf_tasks_unlabeled))
+        self.num_clf_tasks = len(np.unique(self.clf_tasks))
 
-        if self.train_X_extra is not None:
-            self.X_extra = self.train_X_extra + self.test_X_extra
+        if self.X_labeled_extra is not None:
+            self.X_extra = self.X_labeled_extra + self.X_unlabeled_extra
             self.num_extra_features = self.X_extra[0].shape[-1]
         else:
             self.X_extra = None
@@ -61,10 +68,8 @@ class DataWrapper:
 
         scaler = sklearn.preprocessing.StandardScaler().fit(np.concatenate(self.X))
         self.X = list(map(lambda x: scaler.transform(x), self.X))
-        self.X_train = list(map(lambda x: scaler.transform(x), self.train_X))
-        self.X_test = list(map(lambda x: scaler.transform(x), self.test_X))
-        self.X_extra_train = self.train_X_extra
-        self.X_extra_test = self.test_X_extra
+        self.X_labeled = list(map(lambda x: scaler.transform(x), self.X_labeled))
+        self.X_unlabeled = list(map(lambda x: scaler.transform(x), self.X_unlabeled))
 
         self.sample_lengths = np.array(list(map(len, self.X)))
 
@@ -73,8 +78,8 @@ class CVSplit:
     def __init__(self, split_idx, data):
         split = pickle.load(open(mabe.config.ROOT_PATH / f"split_{split_idx}.pkl", "rb"))
 
-        self.indices_tr = split["indices_tr"]
-        self.indices_te = split["indices_te"]
+        self.indices_labeled = split["indices_labeled"]
+        self.indices_unlabeled = split["indices_unlabeled"]
         self.indices = split["indices"]
         self.train_indices_labeled = split["train_indices_labeled"]
         self.train_indices_unlabeled = split["train_indices_unlabeled"]
@@ -92,11 +97,11 @@ class CVSplit:
 
         self.p_draw = sample_lengths / np.sum(sample_lengths)
 
-        self.p_draw_labeled = sample_lengths[self.indices_tr] / np.sum(
-            sample_lengths[self.indices_tr]
+        self.p_draw_labeled = sample_lengths[self.indices_labeled] / np.sum(
+            sample_lengths[self.indices_labeled]
         )
-        self.p_draw_unlabeled = sample_lengths[self.indices_te] / np.sum(
-            sample_lengths[self.indices_te]
+        self.p_draw_unlabeled = sample_lengths[self.indices_unlabeled] / np.sum(
+            sample_lengths[self.indices_unlabeled]
         )
         self.p_draw_train_labeled = sample_lengths[self.train_indices_labeled] / np.sum(
             sample_lengths[self.train_indices_labeled]
@@ -117,20 +122,37 @@ class CVSplit:
             sample_lengths[self.val_indices]
         )
 
-        _, class_counts = np.unique(np.concatenate(data.train_Y).astype(np.int), return_counts=True)
-        self.p_class = class_counts / np.sum(class_counts)
-
     def get_train_batch(self, batch_size, random_noise=0.0, extra_features=False):
+        def random_task_train_index(task):
+            task_train_indices = self.train_indices_labeled[
+                self.data.clf_tasks[self.train_indices_labeled] == task
+            ]
+            task_p_draw = self.data.sample_lengths[task_train_indices].astype(np.float)
+            task_p_draw /= np.sum(task_p_draw)
+            return np.array([np.random.choice(task_train_indices, p=task_p_draw)])
+
+        # at least one sample per task
         indices_batch = np.concatenate(
             (
                 np.random.choice(
-                    self.indices_tr, size=int(0.25 * batch_size), p=self.p_draw_labeled
+                    self.train_indices_labeled,
+                    size=int(0.25 * batch_size),
+                    p=self.p_draw_train_labeled,
                 ),
+                *[
+                    random_task_train_index(task)
+                    for task in range(0, self.data.clf_tasks.max() + 1)
+                ],
                 np.random.choice(
-                    self.indices_te, size=int(0.75 * batch_size), p=self.p_draw_unlabeled
+                    self.indices_unlabeled,
+                    size=int(0.75 * batch_size - self.data.clf_tasks.max() - 1),
+                    p=self.p_draw_unlabeled,
                 ),
             )
         )
+
+        assert np.all([i not in self.val_indices_labeled for i in indices_batch])
+
         X_batch = numba.typed.List()
         augment = lambda x: x + np.random.randn(*x.shape) * random_noise
         if random_noise > 0:
@@ -146,9 +168,13 @@ class CVSplit:
             for i, y in zip(indices_batch, Y_batch)
         ]
 
+        clf_tasks_batch = self.data.clf_tasks[indices_batch]
+
         X_extra_batch = None
         if extra_features:
             X_extra_batch = numba.typed.List()
             [X_extra_batch.append(self.data.X_extra[i].astype(int)) for i in indices_batch]
 
-        return TrainingBatch(X_batch, X_extra_batch, Y_batch, indices_batch, annotators_batch)
+        return TrainingBatch(
+            X_batch, X_extra_batch, Y_batch, indices_batch, annotators_batch, clf_tasks_batch
+        )

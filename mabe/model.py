@@ -1,5 +1,5 @@
 import math
-from typing import List, Tuple
+from typing import Tuple
 
 import numba
 import numpy as np
@@ -225,14 +225,12 @@ def nt_xent_loss(predictions_to, has_value_to=None, cpc_tau=0.07, cpc_alpha=0.5)
 
 
 @numba.njit
-def subsample(X, X_, valid_lengths, combined_length, subsample_from_rand, reverse):
+def subsample(X, X_, valid_lengths, combined_length, subsample_from_rand):
     for i, x in enumerate(X):
         from_idx = math.floor(subsample_from_rand[i] * max(0, len(x) - combined_length))
         to_idx = min(len(x), from_idx + combined_length)
         valid_length = to_idx - from_idx
         sample = x[from_idx:to_idx]
-        if reverse:
-            sample = sample[::-1]
         X_[i, :valid_length] = sample
         valid_lengths[i] = valid_length
 
@@ -251,7 +249,6 @@ class ConvCPC(torch.nn.Module):
         input_dropout=0,
         head_dropout=0,
         dropout=0,
-        reverse_time=False,
         num_extra_features=0,
         **kwargs,
     ):
@@ -283,7 +280,6 @@ class ConvCPC(torch.nn.Module):
         self.num_ahead = num_ahead
         self.num_ahead_subsampling = num_ahead_subsampling
         self.subsample_length = subsample_length
-        self.reverse_time = reverse_time
 
         for m in self.modules():
             if isinstance(m, torch.nn.Conv1d):
@@ -299,7 +295,7 @@ class ConvCPC(torch.nn.Module):
 
     def random_subsample(
         self,
-        batch=mabe.data.TrainingBatch,
+        batch: mabe.data.TrainingBatch,
         subsample_from_rand: TensorType["batch"] = None,
     ) -> Tuple[
         TensorType["batch", "time", "channels", float],
@@ -315,9 +311,7 @@ class ConvCPC(torch.nn.Module):
 
         X_ = np.zeros((batch_size, combined_length, self.num_features), dtype=np.float32)
         valid_lengths = np.zeros(batch_size, dtype=np.int)
-        subsample(
-            batch.X, X_, valid_lengths, combined_length, subsample_from_rand, self.reverse_time
-        )
+        subsample(batch.X, X_, valid_lengths, combined_length, subsample_from_rand)
 
         X_extra_ = None
         if batch.X_extra is not None:
@@ -330,15 +324,12 @@ class ConvCPC(torch.nn.Module):
                 valid_lengths,
                 combined_length,
                 subsample_from_rand,
-                self.reverse_time,
             )
 
         Y_ = None
         if batch.Y is not None:
             Y_ = np.full((batch_size, combined_length), -1, dtype=np.int)
-            subsample(
-                batch.Y, Y_, valid_lengths, combined_length, subsample_from_rand, self.reverse_time
-            )
+            subsample(batch.Y, Y_, valid_lengths, combined_length, subsample_from_rand)
 
         annotators_ = None
         annotators_ = np.full((batch_size, combined_length), -1, dtype=np.int)
@@ -348,14 +339,13 @@ class ConvCPC(torch.nn.Module):
             valid_lengths,
             combined_length,
             subsample_from_rand,
-            self.reverse_time,
         )
 
         return X_, X_extra_, Y_, annotators_, valid_lengths
 
     def subsample_and_pad(
         self,
-        batch=mabe.data.TrainingBatch,
+        batch: mabe.data.TrainingBatch,
         device: str = "cpu",
         subsample_from_rand: TensorType["batch", int] = None,
     ) -> Tuple[
@@ -444,8 +434,6 @@ class ConvCPC(torch.nn.Module):
             bar = progress_bar(range(len(X)))
             for idx in bar:
                 x = X[idx].astype(np.float32)
-                if self.reverse_time:
-                    x = x[::-1]
 
                 x = torch.transpose(torch.from_numpy(x[None, :, :]), 2, 1).to(
                     device, non_blocking=True
@@ -467,14 +455,6 @@ class ConvCPC(torch.nn.Module):
         subsample_from_rand: TensorType["batch", int] = None,
     ):
         batch_size = len(batch.X)
-
-        """
-        if self.reverse_time:
-            X_batch = numba.typed.List([x[::-1] for x in X_batch])
-
-            if Y_batch is not None:
-                Y_batch = numba.typed.List([y[::-1] for y in Y_batch])
-        """
 
         (
             X_batch_samples,
@@ -522,8 +502,9 @@ class MultiAnnotatorLogisticRegressionHead(torch.nn.Module):
         num_features,
         num_annotators,
         num_extra_features=0,
+        num_extra_clf_tasks=0,
         num_classes=4,
-        # annotator_embedding_size=32,
+        num_extra_classes=2,
     ):
         super().__init__()
 
@@ -532,7 +513,11 @@ class MultiAnnotatorLogisticRegressionHead(torch.nn.Module):
         self.num_features_combined = num_features + num_extra_features
 
         self.ln = torch.nn.LayerNorm(num_features)
-        self.logreg = torch.nn.Linear(self.num_features_combined, num_classes)
+
+        self.logregs = [torch.nn.Linear(self.num_features_combined, num_classes)]
+        for i in range(num_extra_clf_tasks):
+            self.logregs.append(torch.nn.Linear(self.num_features_combined, num_extra_classes))
+        self.logregs = torch.nn.ModuleList(self.logregs)
 
         self.residual = torch.nn.Sequential(
             torch.nn.Linear(
@@ -550,7 +535,6 @@ class MultiAnnotatorLogisticRegressionHead(torch.nn.Module):
         self.embedding = torch.nn.Parameter((torch.diag(torch.ones(num_annotators))).detach())
         self.register_parameter(name="embedding", param=self.embedding)
 
-        # TODO: init linear using label distribution
         for m in self.modules():
             if isinstance(m, torch.nn.LayerNorm):
                 torch.nn.init.constant_(m.weight, 1)
@@ -560,7 +544,7 @@ class MultiAnnotatorLogisticRegressionHead(torch.nn.Module):
                 if m.bias is not None:
                     torch.nn.init.zeros_(m.bias)
 
-    def forward(self, x, x_extra, annotators):
+    def forward(self, x, x_extra, annotators, clf_task):
         x = self.ln(x)
         a = self.embedding[annotators.flatten()].reshape(*annotators.shape, -1)
 
@@ -569,6 +553,6 @@ class MultiAnnotatorLogisticRegressionHead(torch.nn.Module):
 
         x = torch.cat((x, x_extra), dim=-1) + x_
 
-        logits = self.logreg(x)
+        logits = self.logregs[clf_task](x)
 
         return logits
