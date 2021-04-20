@@ -224,7 +224,7 @@ def nt_xent_loss(predictions_to, has_value_to=None, cpc_tau=0.07, cpc_alpha=0.5)
     return loss
 
 
-@numba.njit
+# @numba.njit
 def subsample(X, X_, valid_lengths, combined_length, subsample_from_rand):
     for i, x in enumerate(X):
         from_idx = math.floor(subsample_from_rand[i] * max(0, len(x) - combined_length))
@@ -292,6 +292,27 @@ class ConvCPC(torch.nn.Module):
                 torch.nn.init.kaiming_normal_(m.weight, mode="fan_out")
                 if m.bias is not None:
                     torch.nn.init.zeros_(m.bias)
+
+        self.crop_pre = None
+        self.crop_post = None
+
+    def get_crops(self, device):
+        if self.crop_pre is None:
+            with torch.no_grad():
+                initial_length = 128
+                x_dummy = torch.zeros(1, self.num_features, initial_length, device=device)
+                x_postemb = self.embedder(x_dummy)
+
+                crop = (initial_length - x_postemb.shape[-1]) // 2
+                self.crop_pre = crop
+                self.crop_post = crop
+
+                x_postcontext = self.apply_contexter(x_postemb, device)
+
+                crop = x_postemb.shape[-1] - x_postcontext.shape[-1]
+                self.crop_pre += crop
+
+        return self.crop_pre, self.crop_post
 
     def random_subsample(
         self,
@@ -446,6 +467,46 @@ class ConvCPC(torch.nn.Module):
         contexts = np.concatenate(contexts)
         return contexts
 
+    def add_padding_to_batch(self, batch: mabe.data.TrainingBatch, device: str):
+        crop_pre, crop_post = self.get_crops(device)
+
+        def concat_padding_1d(sequences):
+            l = numba.typed.List()
+            for x in sequences:
+                l.append(
+                    np.concatenate(
+                        (
+                            np.zeros((crop_pre,), dtype=x.dtype),
+                            x,
+                            np.zeros((crop_post,), dtype=x.dtype),
+                        ),
+                        axis=-1,
+                    )
+                )
+            return l
+
+        def concat_padding_2d(sequences):
+            l = numba.typed.List()
+            for x in sequences:
+                l.append(
+                    np.concatenate(
+                        (
+                            np.zeros((crop_pre, x.shape[1]), dtype=x.dtype),
+                            x,
+                            np.zeros((crop_post, x.shape[1]), dtype=x.dtype),
+                        ),
+                        axis=0,
+                    )
+                )
+            return l
+
+        batch.X = concat_padding_2d(batch.X)
+        batch.X_extra = concat_padding_2d(batch.X_extra)
+        batch.Y = concat_padding_1d(batch.Y)
+        batch.annotators = concat_padding_1d(batch.annotators)
+
+        return batch
+
     def forward(
         self,
         batch: mabe.data.TrainingBatch,
@@ -455,6 +516,7 @@ class ConvCPC(torch.nn.Module):
         subsample_from_rand: TensorType["batch", int] = None,
     ):
         batch_size = len(batch.X)
+        batch = self.add_padding_to_batch(batch, device)
 
         (
             X_batch_samples,

@@ -1,6 +1,7 @@
 import collections
 import copy
 import dataclasses
+import io
 import pathlib
 
 import madgrad
@@ -77,12 +78,9 @@ class Trainer:
         self.split = split
         self.device = device
 
-        """
         self.batches_per_epoch = int(
             sum(data.sample_lengths) / config.subsample_length / config.batch_size
         )
-        """
-        self.batches_per_epoch = 10
         self.num_extra_clf_tasks = (
             len(np.unique(data.clf_tasks)) - 2
         )  # task12 clf and -1 for test data
@@ -160,41 +158,47 @@ class Trainer:
         self.best_params = {}
         self.best_val_f1 = {}
 
+        for task in range(self.num_extra_clf_tasks + 1):
+            self.best_params[task] = (
+                self.get_cpu_params(self.cpc),
+                self.get_cpu_params(self.logreg),
+            )
+
     def validation_f1(self, task: int):
         with torch.no_grad():
             cpc = self.cpc.eval()
             predictions = []
             labels = []
+
+            crop_pre, crop_post = cpc.get_crops(self.device)
+
+            def add_padding(seq):
+                return np.concatenate(
+                    (
+                        np.zeros_like(seq)[:crop_pre],
+                        seq,
+                        np.zeros_like(seq)[:crop_post],
+                    )
+                )
+
             with torch.no_grad():
                 for idx in self.split.val_indices_labeled:
                     if self.data.clf_tasks[idx] != task:
                         continue
 
-                    x = self.data.X_labeled[idx].astype(np.float32)
+                    y = self.data.Y_labeled[idx]
+                    a = np.array([self.data.annotators_labeled[idx]]).repeat(len(y))
+                    x = add_padding(self.data.X_labeled[idx].astype(np.float32))
                     if self.config.use_extra_features:
                         x_extra = self.data.X_labeled_extra[idx].astype(np.float32)
                         x_extra = torch.from_numpy(x_extra).to(self.device, non_blocking=True)
-                    y = self.data.Y_labeled[idx]
-                    a = np.array([self.data.annotators_labeled[idx]]).repeat(len(y))
 
                     x = torch.transpose(torch.from_numpy(x[None, :, :]), 2, 1).to(
                         self.device, non_blocking=True
                     )
                     x_emb = cpc.embedder(x)
 
-                    crop = (y.shape[-1] - x_emb.shape[-1]) // 2
-                    y = y[crop:-crop]
-                    a = a[crop:-crop]
-                    if self.config.use_extra_features:
-                        x_extra = x_extra[crop:-crop]
-
                     c = cpc.apply_contexter(x_emb, self.device)
-
-                    crop = len(y) - c.shape[-1]
-                    y = y[crop:]
-                    a = a[crop:]
-                    if self.config.use_extra_features:
-                        x_extra = x_extra[crop:]
 
                     logreg_features = c[0].T
                     l = self.logreg(logreg_features, x_extra, a, task)
@@ -321,10 +325,11 @@ class Trainer:
             + f"LR: {self.get_lr(self.optimizer):.4f}"
         )
 
+    @staticmethod
+    def get_cpu_params(model):
+        return copy.deepcopy({k: v.cpu() for k, v in model.state_dict().items()})
+
     def finalize_epoch(self):
-        get_cpu_params = lambda model: copy.deepcopy(
-            {k: v.cpu() for k, v in model.state_dict().items()}
-        )
         for task in range(self.num_extra_clf_tasks + 1):
             val_f1 = self.validation_f1(task)
 
@@ -333,8 +338,8 @@ class Trainer:
                 if task == 0:
                     if val_f1 > self.best_val_f1[task]:
                         self.best_params[task] = (
-                            get_cpu_params(self.cpc),
-                            get_cpu_params(self.logreg),
+                            self.get_cpu_params(self.cpc),
+                            self.get_cpu_params(self.logreg),
                         )
                 self.best_val_f1[task] = max(val_f1, self.best_val_f1[task])
             self.clf_val_f1s[task].append(val_f1)
