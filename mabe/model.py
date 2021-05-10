@@ -10,7 +10,7 @@ from torchtyping import TensorType  # type: ignore
 
 import mabe
 import mabe.data
-from mabe.types import batch, channels, time
+from mabe.types import annotator, batch, behavior, channels, classes, time
 
 torchtyping.patch_typeguard()
 master_bar, progress_bar = force_console_behavior()
@@ -322,6 +322,8 @@ class ConvCPC(torch.nn.Module):
         TensorType["batch", "time", "channels", float],
         TensorType["batch", "time", "channels", float],
         TensorType["batch", "time", int],
+        TensorType["batch", "time", "behavior", "classes", float],
+        TensorType["batch", "time", "annotator", "classes", float],
         TensorType["batch", "time", int],
         TensorType["batch", int],
     ]:
@@ -352,6 +354,40 @@ class ConvCPC(torch.nn.Module):
             Y_ = np.full((batch_size, combined_length), -1, dtype=np.int)
             subsample(batch.Y, Y_, valid_lengths, combined_length, subsample_from_rand)
 
+        Y_dark_behaviors_ = None
+        if batch.Y_dark_behaviors is not None:
+            num_dark_behaviors = batch.Y_dark_behaviors[0].shape[1]
+            num_dark_behaviors_classes = batch.Y_dark_behaviors[0].shape[2]
+            Y_dark_behaviors_ = np.full(
+                (batch_size, combined_length, num_dark_behaviors, num_dark_behaviors_classes),
+                -1,
+                dtype=np.float32,
+            )
+            subsample(
+                batch.Y_dark_behaviors,
+                Y_dark_behaviors_,
+                valid_lengths,
+                combined_length,
+                subsample_from_rand,
+            )
+
+        Y_dark_annotators_ = None
+        if batch.Y_dark_annotators is not None:
+            num_dark_annotators = batch.Y_dark_annotators[0].shape[1]
+            num_dark_annotators_classes = batch.Y_dark_annotators[0].shape[2]
+            Y_dark_annotators_ = np.full(
+                (batch_size, combined_length, num_dark_annotators, num_dark_annotators_classes),
+                -1,
+                dtype=np.float32,
+            )
+            subsample(
+                batch.Y_dark_annotators,
+                Y_dark_annotators_,
+                valid_lengths,
+                combined_length,
+                subsample_from_rand,
+            )
+
         annotators_ = None
         annotators_ = np.full((batch_size, combined_length), -1, dtype=np.int)
         subsample(
@@ -362,7 +398,7 @@ class ConvCPC(torch.nn.Module):
             subsample_from_rand,
         )
 
-        return X_, X_extra_, Y_, annotators_, valid_lengths
+        return X_, X_extra_, Y_, Y_dark_behaviors_, Y_dark_annotators_, annotators_, valid_lengths
 
     def subsample_and_pad(
         self,
@@ -373,12 +409,20 @@ class ConvCPC(torch.nn.Module):
         TensorType["batch", "time", "channels", float],
         TensorType["batch", "time", "channels", float],
         TensorType["batch", "time", int],
+        TensorType["batch", "time", "behavior", "classes", float],
+        TensorType["batch", "time", "annotator", "classes", float],
         TensorType["batch", "time", int],
         TensorType["batch", int],
     ]:
-        X, X_extra, Y, annotators, valid_lengths = self.random_subsample(
-            batch, subsample_from_rand=subsample_from_rand
-        )
+        (
+            X,
+            X_extra,
+            Y,
+            Y_dark_behaviors,
+            Y_dark_annotators,
+            annotators,
+            valid_lengths,
+        ) = self.random_subsample(batch, subsample_from_rand=subsample_from_rand)
         X = torch.transpose(torch.from_numpy(X), 2, 1).to(device, non_blocking=True)
 
         if X_extra is not None:
@@ -387,7 +431,13 @@ class ConvCPC(torch.nn.Module):
         if Y is not None:
             Y = torch.from_numpy(Y).to(device, non_blocking=True)
 
-        return X, X_extra, Y, annotators, valid_lengths
+        if Y_dark_behaviors is not None:
+            Y_dark_behaviors = torch.from_numpy(Y_dark_behaviors).to(device, non_blocking=True)
+
+        if Y_dark_annotators is not None:
+            Y_dark_annotators = torch.from_numpy(Y_dark_annotators).to(device, non_blocking=True)
+
+        return X, X_extra, Y, Y_dark_behaviors, Y_dark_annotators, annotators, valid_lengths
 
     def cpc_loss(
         self,
@@ -485,24 +535,28 @@ class ConvCPC(torch.nn.Module):
                 )
             return l
 
-        def concat_padding_2d(sequences):
+        def concat_padding_nd(sequences):
             l = numba.typed.List()
             for x in sequences:
                 l.append(
                     np.concatenate(
                         (
-                            np.zeros((crop_pre, x.shape[1]), dtype=x.dtype),
+                            np.zeros((crop_pre, *x.shape[1:]), dtype=x.dtype),
                             x,
-                            np.zeros((crop_post, x.shape[1]), dtype=x.dtype),
+                            np.zeros((crop_post, *x.shape[1:]), dtype=x.dtype),
                         ),
                         axis=0,
                     )
                 )
             return l
 
-        batch.X = concat_padding_2d(batch.X)
-        batch.X_extra = concat_padding_2d(batch.X_extra)
+        batch.X = concat_padding_nd(batch.X)
+        batch.X_extra = concat_padding_nd(batch.X_extra)
         batch.Y = concat_padding_1d(batch.Y)
+        if batch.Y_dark_behaviors is not None:
+            batch.Y_dark_behaviors = concat_padding_nd(batch.Y_dark_behaviors)
+        if batch.Y_dark_annotators is not None:
+            batch.Y_dark_annotators = concat_padding_nd(batch.Y_dark_annotators)
         batch.annotators = concat_padding_1d(batch.annotators)
 
         return batch
@@ -515,6 +569,7 @@ class ConvCPC(torch.nn.Module):
         min_from_timesteps: int = 0,
         subsample_from_rand: TensorType["batch", int] = None,
     ):
+        # TODO: refactor subsampling
         batch_size = len(batch.X)
         batch = self.add_padding_to_batch(batch, device)
 
@@ -522,6 +577,8 @@ class ConvCPC(torch.nn.Module):
             X_batch_samples,
             X_extra_batch_samples,
             Y_batch_samples,
+            Y_batch_dark_behaviors_samples,
+            Y_batch_dark_annotators_samples,
             annotators_samples,
             valid_lengths,
         ) = self.subsample_and_pad(batch, device, subsample_from_rand=subsample_from_rand)
@@ -533,6 +590,10 @@ class ConvCPC(torch.nn.Module):
             X_extra_batch_samples = X_extra_batch_samples[:, crop:-crop]
         if Y_batch_samples is not None:
             Y_batch_samples = Y_batch_samples[:, crop:-crop]
+        if Y_batch_dark_behaviors_samples is not None:
+            Y_batch_dark_behaviors_samples = Y_batch_dark_behaviors_samples[:, crop:-crop]
+        if Y_batch_dark_annotators_samples is not None:
+            Y_batch_dark_annotators_samples = Y_batch_dark_annotators_samples[:, crop:-crop]
         annotators_samples = annotators_samples[:, crop:-crop]
 
         max_from_timesteps = [x.shape[-1] - (self.num_ahead + crop) for x in X_emb]
@@ -549,13 +610,32 @@ class ConvCPC(torch.nn.Module):
             X_extra_batch_samples = X_extra_batch_samples[:, crop:]
         if Y_batch_samples is not None:
             Y_batch_samples = Y_batch_samples[:, crop:]
-            annotators_samples = annotators_samples[:, crop:]
+        if Y_batch_dark_behaviors_samples is not None:
+            Y_batch_dark_behaviors_samples = Y_batch_dark_behaviors_samples[:, crop:]
+        if Y_batch_dark_annotators_samples is not None:
+            Y_batch_dark_annotators_samples = Y_batch_dark_annotators_samples[:, crop:]
+        annotators_samples = annotators_samples[:, crop:]
 
         if with_loss:
             batch_loss = self.cpc_loss(X_emb, contexts, from_timesteps, valid_lengths)
-            return contexts, X_extra_batch_samples, Y_batch_samples, annotators_samples, batch_loss
+            return (
+                contexts,
+                X_extra_batch_samples,
+                Y_batch_samples,
+                Y_batch_dark_behaviors_samples,
+                Y_batch_dark_annotators_samples,
+                annotators_samples,
+                batch_loss,
+            )
         else:
-            return contexts, X_extra_batch_samples, Y_batch_samples, annotators_samples
+            return (
+                contexts,
+                X_extra_batch_samples,
+                Y_batch_samples,
+                Y_batch_dark_behaviors_samples,
+                Y_batch_dark_annotators_samples,
+                annotators_samples,
+            )
 
 
 class MultiAnnotatorLogisticRegressionHead(torch.nn.Module):

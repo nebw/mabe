@@ -1,8 +1,32 @@
+import joblib
 import numba
 import numpy as np
+import scipy
+import scipy.spatial
+import sklearn
+import sklearn.cross_decomposition
+import sklearn.preprocessing
 from fastprogress.fastprogress import force_console_behavior
 
+import mabe
+import mabe.config
+
 master_bar, progress_bar = force_console_behavior()
+
+
+class PLSRegressionWrapper(sklearn.cross_decomposition.PLSRegression):
+    def transform(self, X):
+        return super().transform(X)
+
+    def fit(self, X, Y):
+        Y = sklearn.preprocessing.OneHotEncoder(sparse=False).fit_transform(Y[:, None])
+        return super().fit(X, Y)
+
+    def fit_transform(self, X, Y):
+        return self.fit(X, Y).transform(X)
+
+
+pose_pca = joblib.load(mabe.config.ROOT_PATH / "pose_pca.joblib")
 
 
 @numba.njit
@@ -73,7 +97,47 @@ def get_movement_velocity_orienation(mouse):
     return velocity, orientation_change
 
 
-def transform_to_feature_vector(trajectory, with_abs_pos=False):
+def wall_dist(mid):
+    xmax = 1020
+    ymax = 570
+
+    wall_dist = np.linalg.norm(
+        np.stack(
+            (
+                np.stack((mid[:, 0], xmax - mid[:, 0])).min(axis=0),
+                np.stack((mid[:, 1], ymax - mid[:, 1])).min(axis=0),
+            )
+        ),
+        axis=0,
+    )
+
+    return np.tanh(wall_dist / 465)
+
+
+def get_pdists(trajectory):
+    t = trajectory.transpose(0, 1, 3, 2)
+    t = t.reshape(t.shape[0], -1, t.shape[-1])[1:]
+
+    X_pdists = np.stack([scipy.spatial.distance.pdist(s) for s in t])
+    X_pdists = np.log1p(X_pdists)
+
+    return pose_pca.transform(X_pdists)
+
+
+"""
+def transform_to_feature_vector(
+    trajectory, with_abs_pos=False, with_wall_dist=True, with_pdists=True
+):
+    t = trajectory.transpose(0, 1, 3, 2)
+    t = t.reshape(t.shape[0], -1, t.shape[-1])[1:]
+
+    return t, t
+"""
+
+
+def transform_to_feature_vector(
+    trajectory, with_abs_pos=False, with_wall_dist=True, with_pdists=True
+):
     m0 = trajectory[:, 0, :, :].copy()
     m1 = trajectory[:, 1, :, :].copy()
     velocity, orientation = get_movement_velocity_orienation(m0)
@@ -92,11 +156,17 @@ def transform_to_feature_vector(trajectory, with_abs_pos=False):
         (m0[1:], m1[1:], velocity, orientation, relative_position_info[1:]), axis=1
     )
 
-    indices = np.arange(0, velocity.shape[0])
-    is_beginning = np.clip(indices / 2000, 0, 1).reshape(-1, 1)
-    is_ending = np.clip((velocity.shape[0] - indices) / 16000, 0, 1).reshape(-1, 1)
+    if with_pdists:
+        pdists = get_pdists(trajectory)
+        features = np.concatenate((features, pdists), axis=1)
 
-    extra_features = np.concatenate((is_beginning, is_ending), axis=1)
+    indices = np.arange(0, velocity.shape[0])
+    is_beginning = np.tanh(indices / 1500).reshape(-1, 1)
+    is_ending = np.tanh((velocity.shape[0] - indices) / 2300).reshape(-1, 1)
+
+    extra_features = np.concatenate(
+        (is_beginning, is_ending, wall_dist(mid0)[1:, None], wall_dist(mid1)[1:, None]), axis=1
+    )
 
     return features, extra_features
 
