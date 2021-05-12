@@ -21,7 +21,7 @@ num_splits = 32
 master_bar, progress_bar = force_console_behavior()
 
 # %%
-feature_path = mabe.config.ROOT_PATH / "features_task123.hdf5"
+feature_path = mabe.config.ROOT_PATH / "features_task123_final_pca.hdf5"
 
 # %%
 with h5py.File(feature_path, "r") as hdf:

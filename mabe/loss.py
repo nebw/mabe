@@ -1,5 +1,3 @@
-import math
-
 import numba
 import numpy
 import numpy as np
@@ -295,7 +293,7 @@ def weighted_hinge_loss(labels, logits, positive_weights=1.0, negative_weights=1
             "must be the same! "
             "shape of positive_weights is {0}, "
             "but shape of negative_weights is {1}"
-            % (positive_weights.size(), negative_weights.size())
+            % {0: positive_weights.size(), 1: negative_weights.size()}
         )
 
     # positive_term: Tensor [N, C] or [N, C, K]

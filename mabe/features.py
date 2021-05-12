@@ -3,27 +3,12 @@ import numba
 import numpy as np
 import scipy
 import scipy.spatial
-import sklearn
-import sklearn.cross_decomposition
-import sklearn.preprocessing
 from fastprogress.fastprogress import force_console_behavior
 
 import mabe
 import mabe.config
 
 master_bar, progress_bar = force_console_behavior()
-
-
-class PLSRegressionWrapper(sklearn.cross_decomposition.PLSRegression):
-    def transform(self, X):
-        return super().transform(X)
-
-    def fit(self, X, Y):
-        Y = sklearn.preprocessing.OneHotEncoder(sparse=False).fit_transform(Y[:, None])
-        return super().fit(X, Y)
-
-    def fit_transform(self, X, Y):
-        return self.fit(X, Y).transform(X)
 
 
 pose_pca = joblib.load(mabe.config.ROOT_PATH / "pose_pca.joblib")
@@ -124,20 +109,15 @@ def get_pdists(trajectory):
     return pose_pca.transform(X_pdists)
 
 
-"""
 def transform_to_feature_vector(
-    trajectory, with_abs_pos=False, with_wall_dist=True, with_pdists=True
+    trajectory, with_abs_pos=False, with_wall_dist=True, with_pdists=True, raw_trajectories=False
 ):
-    t = trajectory.transpose(0, 1, 3, 2)
-    t = t.reshape(t.shape[0], -1, t.shape[-1])[1:]
+    if raw_trajectories:
+        t = trajectory.transpose(0, 1, 3, 2)
+        t = t.reshape(t.shape[0], -1, t.shape[-1])[1:]
 
-    return t, t
-"""
+        return t, t
 
-
-def transform_to_feature_vector(
-    trajectory, with_abs_pos=False, with_wall_dist=True, with_pdists=True
-):
     m0 = trajectory[:, 0, :, :].copy()
     m1 = trajectory[:, 1, :, :].copy()
     velocity, orientation = get_movement_velocity_orienation(m0)
@@ -171,8 +151,10 @@ def transform_to_feature_vector(
     return features, extra_features
 
 
-def get_features_and_labels(sample_sequence):
-    features, extra_features = transform_to_feature_vector(sample_sequence["keypoints"])
+def get_features_and_labels(sample_sequence, raw_trajectories=False):
+    features, extra_features = transform_to_feature_vector(
+        sample_sequence["keypoints"], raw_trajectories=raw_trajectories
+    )
     if "annotations" in sample_sequence:
         labels = sample_sequence["annotations"]
         labels = labels[1:]
@@ -184,7 +166,7 @@ def get_features_and_labels(sample_sequence):
     return features, extra_features, labels, annotator
 
 
-def load_dataset(path=None, raw_data=None):
+def load_dataset(path=None, raw_data=None, raw_trajectories=False):
     assert path is not None or raw_data is not None
     if raw_data is None:
         raw_data = np.load(path, allow_pickle=True).item()
@@ -201,7 +183,7 @@ def load_dataset(path=None, raw_data=None):
     annotators = []
 
     for key, data in raw_data.items():
-        x, x_extra, y, annotator = get_features_and_labels(data)
+        x, x_extra, y, annotator = get_features_and_labels(data, raw_trajectories=raw_trajectories)
         X.append(x)
         X_extra.append(x_extra)
         Y.append(y)
@@ -211,10 +193,12 @@ def load_dataset(path=None, raw_data=None):
     return X, X_extra, Y, groups, annotators
 
 
-def load_task3_datasets(path):
+def load_task3_datasets(path, raw_trajectories=False):
     raw_data = np.load(path, allow_pickle=True).item()
 
     for behavior_key in raw_data.keys():
         raw_data_behavior = raw_data[behavior_key]
 
-        yield behavior_key, load_dataset(raw_data=raw_data_behavior)
+        yield behavior_key, load_dataset(
+            raw_data=raw_data_behavior, raw_trajectories=raw_trajectories
+        )
