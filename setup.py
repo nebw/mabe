@@ -24,6 +24,6 @@ setup(
         "torchtyping",
         "fastprogress",
         "madgrad",
-        "bayes_opt",
+        "bayesian-optimization",
     ],
 )
